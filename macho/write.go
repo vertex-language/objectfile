@@ -58,9 +58,9 @@ const (
 // ── Load command identifiers ──────────────────────────────────────────────────
 
 const (
-	lcSegment64     uint32 = 0x19 // LC_SEGMENT_64
-	lcSymtab        uint32 = 0x2  // LC_SYMTAB
-	lcBuildVersion  uint32 = 0x32 // LC_BUILD_VERSION
+	lcSegment64    uint32 = 0x19 // LC_SEGMENT_64
+	lcSymtab       uint32 = 0x2  // LC_SYMTAB
+	lcBuildVersion uint32 = 0x32 // LC_BUILD_VERSION
 )
 
 // ── VM protection ─────────────────────────────────────────────────────────────
@@ -203,19 +203,19 @@ const (
 
 // ARM64 Mach-O relocation types.
 const (
-	arm64RelocUnsigned        uint8 = 0 // absolute (pointer-sized)
-	arm64RelocSubtractor      uint8 = 1 // must be followed by ARM64_RELOC_UNSIGNED
-	arm64RelocBranch26        uint8 = 2 // BL/B  26-bit PC-relative
-	arm64RelocPage21          uint8 = 3 // ADR page21
-	arm64RelocPageoff12       uint8 = 4 // page offset12
-	arm64RelocGOTLoadPage21   uint8 = 5 // ADR GOT page21
+	arm64RelocUnsigned         uint8 = 0 // absolute (pointer-sized)
+	arm64RelocSubtractor       uint8 = 1 // must be followed by ARM64_RELOC_UNSIGNED
+	arm64RelocBranch26         uint8 = 2 // BL/B  26-bit PC-relative
+	arm64RelocPage21           uint8 = 3 // ADR page21
+	arm64RelocPageoff12        uint8 = 4 // page offset12
+	arm64RelocGOTLoadPage21    uint8 = 5 // ADR GOT page21
 	arm64RelocGOTLoadPageoff12 uint8 = 6 // GOT page offset12
 )
 
 // ── r_length encoding ─────────────────────────────────────────────────────────
 // r_length encodes the byte width of the relocated field as log2:
-//   0 → 1 byte, 1 → 2 bytes, 2 → 4 bytes, 3 → 8 bytes
-
+//
+//	0 → 1 byte, 1 → 2 bytes, 2 → 4 bytes, 3 → 8 bytes
 const (
 	rLength1 uint8 = 0
 	rLength2 uint8 = 1
@@ -246,7 +246,8 @@ type relocDesc struct {
 	pcrel  bool
 }
 
-func (f *File) relocDesc(k enc.RelocKind) (relocDesc, error) {
+// FIX 1: enc.RelocKind → mir.RelocKind; the kind lives in the mir package.
+func (f *File) relocDesc(k mir.RelocKind) (relocDesc, error) {
 	switch f.cpuType {
 	case cpuTypeX86_64:
 		switch k {
@@ -381,8 +382,8 @@ func (f *File) build() ([]byte, error) {
 		// anonymous in Mach-O; n_strx=0 (empty) is conventional.
 		syms = append(syms, nlist64{
 			NStrx:  0,
-			NType:  nSect,          // local, defined in section
-			NSect:  uint8(1 + i),   // 1-based section index
+			NType:  nSect,        // local, defined in section
+			NSect:  uint8(1 + i), // 1-based section index
 			NDesc:  0,
 			NValue: 0,
 		})
@@ -396,10 +397,10 @@ func (f *File) build() ([]byte, error) {
 		}
 		idx := uint32(len(syms))
 		sym := nlist64{
-			NStrx: strtab.intern("_" + s.Name), // Mach-O convention: leading underscore
-			NType: nSect | nExt,
-			NSect: uint8(1 + i),
-			NDesc: 0,
+			NStrx:  strtab.intern("_" + s.Name), // Mach-O convention: leading underscore
+			NType:  nSect | nExt,
+			NSect:  uint8(1 + i),
+			NDesc:  0,
 			NValue: 0,
 		}
 		syms = append(syms, sym)
@@ -411,10 +412,10 @@ func (f *File) build() ([]byte, error) {
 	for _, name := range externalSymbols(f.sections) {
 		idx := uint32(len(syms))
 		syms = append(syms, nlist64{
-			NStrx: strtab.intern("_" + name),
-			NType: nUndf | nExt,
-			NSect: noSect,
-			NDesc: 0,
+			NStrx:  strtab.intern("_" + name),
+			NType:  nUndf | nExt,
+			NSect:  noSect,
+			NDesc:  0,
 			NValue: 0,
 		})
 		symIdx[name] = idx
@@ -457,9 +458,10 @@ func (f *File) build() ([]byte, error) {
 				rSymNum = si
 			}
 
+			// FIX 2: r.Offset is int32; cast to uint32 for the RAddress field.
 			records[j] = relocInfo{
-				RAddress: r.Offset,
-				RInfo: packRelocInfo(rSymNum, rd.pcrel, rd.length, isExternal, rd.rtype),
+				RAddress: uint32(r.Offset),
+				RInfo:    packRelocInfo(rSymNum, rd.pcrel, rd.length, isExternal, rd.rtype),
 			}
 		}
 		secRel[i].records = records
@@ -504,12 +506,14 @@ func (f *File) build() ([]byte, error) {
 				rawSize:  uint32(len(s.Code)),
 			}
 		case enc.SectionBSS:
+			// FIX 3: Section.Size field was removed; BSS size is now len(s.Code),
+			// which the encoder sets to the required zero-fill byte count.
 			meta[i] = secMeta{
 				segName:  "__DATA",
 				sectName: "__bss",
 				flags:    sTypeZerofill,
 				align:    8,
-				bssSize:  uint64(s.Size),
+				bssSize:  uint64(len(s.Code)),
 			}
 		}
 	}
