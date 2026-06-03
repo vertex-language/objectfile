@@ -63,11 +63,11 @@ type coffReloc struct {
 // coffSym is the 18-byte symbol table entry (IMAGE_SYMBOL).
 // NumberOfAuxiliarySymbols is always 0; we emit no auxiliary records.
 type coffSym struct {
-	Name                    [8]byte // inline or \0\0\0\0 + strtab offset
-	Value                   uint32
-	SectionNumber           int16
-	Type                    uint16
-	StorageClass            uint8
+	Name                     [8]byte // inline or \0\0\0\0 + strtab offset
+	Value                    uint32
+	SectionNumber            int16
+	Type                     uint16
+	StorageClass             uint8
 	NumberOfAuxiliarySymbols uint8
 }
 
@@ -118,7 +118,8 @@ const (
 
 // ── Relocation kind → COFF type ───────────────────────────────────────────────
 
-func (f *File) relocType(k enc.RelocKind) (uint16, error) {
+// FIX 1: enc.RelocKind no longer exists; the type now lives in the mir package.
+func (f *File) relocType(k mir.RelocKind) (uint16, error) {
 	switch f.machine {
 	case machineAMD64:
 		switch k {
@@ -173,10 +174,6 @@ func setSectionName(field *[8]byte, name string, strtab *strTab) {
 	}
 	off := strtab.intern(name) + 4 // +4 for the size prefix
 	s := fmt.Sprintf("/%d", off)
-	// The longest possible offset string for a 32-bit offset is 11 chars
-	// ("/" + 10 digits), which does not fit in 8 bytes.  In practice object
-	// files contain a modest number of strings; 7-digit decimal fits in 8
-	// bytes.  Overflow here would indicate an extremely large string table.
 	copy(field[:], s)
 }
 
@@ -311,11 +308,13 @@ func (f *File) build() ([]byte, error) {
 				rawSize: uint32(len(s.Code)),
 			}
 		case enc.SectionBSS:
+			// FIX 2: encoder.Section.Size was removed; BSS reserve size is
+			// now expressed as len(s.Code), consistent with all other kinds.
 			meta[i] = secMeta{
 				chars:   scnCntUninit | scnMemRead | scnMemWrite | scnAlign8,
 				align:   8,
 				rawSize: 0,
-				bssSize: uint32(s.Size),
+				bssSize: uint32(len(s.Code)),
 			}
 		}
 	}
@@ -397,8 +396,10 @@ func (f *File) build() ([]byte, error) {
 			if err != nil {
 				return nil, fmt.Errorf("coff: section %q: %w", s.Name, err)
 			}
+			// FIX 3: r.Offset is now int32; cast explicitly to uint32 for
+			// the VirtualAddress field of the COFF relocation record.
 			recs = append(recs, coffReloc{
-				VirtualAddress:   r.Offset,
+				VirtualAddress:   uint32(r.Offset),
 				SymbolTableIndex: si,
 				Type:             rt,
 			})
