@@ -245,7 +245,8 @@ func rinfo32(sym, typ uint32) uint32 { return (sym << 8) | (typ & 0xFF) }
 
 // ── Relocation kind → ELF type number ────────────────────────────────────────
 
-func (f *File) relocType(k enc.RelocKind) (uint32, error) {
+// FIX 1: parameter type is mir.RelocKind, not enc.RelocKind.
+func (f *File) relocType(k mir.RelocKind) (uint32, error) {
 	switch f.machine {
 	case emX86_64:
 		switch k {
@@ -371,11 +372,13 @@ func (f *File) build64() ([]byte, error) {
 
 	// ── Phase 2: RELA section data ────────────────────────────────────────
 
-	type relaWork struct {
+	// FIX 2a: rename local type to relaEntry so it no longer conflicts with
+	// the relaWork variable declared immediately below.
+	type relaEntry struct {
 		contentIdx int    // index into f.sections
 		data       []byte // encoded Elf64_Rela entries
 	}
-	var relaWork []relaWork
+	var relaWork []relaEntry
 
 	for i, s := range f.sections {
 		if len(s.Relocs) == 0 {
@@ -401,10 +404,8 @@ func (f *File) build64() ([]byte, error) {
 				return nil, fmt.Errorf("elf: encode rela: %w", err)
 			}
 		}
-		relaWork = append(relaWork, struct {
-			contentIdx int
-			data       []byte
-		}{i, buf.Bytes()})
+		// FIX 2b: use the renamed relaEntry composite literal.
+		relaWork = append(relaWork, relaEntry{i, buf.Bytes()})
 	}
 
 	// ── Phase 3: section descriptor list ─────────────────────────────────
@@ -454,7 +455,10 @@ func (f *File) build64() ([]byte, error) {
 			d.shType = shtNoBits
 			d.flags = shfAlloc | shfWrite
 			d.align = 8
-			d.noSize = uint64(s.Size)
+			// FIX 3: encoder.Section has no Size field; derive BSS size from
+			// the length of the Code slice (the encoder fills it with zeros
+			// to encode the reservation size).
+			d.noSize = uint64(len(s.Code))
 		}
 		descs = append(descs, d)
 	}
@@ -652,11 +656,12 @@ func (f *File) build32() ([]byte, error) {
 
 	// ── Phase 2: RELA sections ────────────────────────────────────────────
 
-	type relaWork struct {
+	// FIX 2a (32-bit): same rename as in build64.
+	type relaEntry struct {
 		contentIdx int
 		data       []byte
 	}
-	var relaWork []relaWork
+	var relaWork []relaEntry
 
 	for i, s := range f.sections {
 		if len(s.Relocs) == 0 {
@@ -682,10 +687,8 @@ func (f *File) build32() ([]byte, error) {
 				return nil, fmt.Errorf("elf: encode rela32: %w", err)
 			}
 		}
-		relaWork = append(relaWork, struct {
-			contentIdx int
-			data       []byte
-		}{i, buf.Bytes()})
+		// FIX 2b (32-bit): use the renamed relaEntry composite literal.
+		relaWork = append(relaWork, relaEntry{i, buf.Bytes()})
 	}
 
 	// ── Phase 3: section descriptor list ─────────────────────────────────
@@ -725,7 +728,8 @@ func (f *File) build32() ([]byte, error) {
 			d.shType = shtNoBits
 			d.flags = shfAlloc | shfWrite
 			d.align = 4
-			d.noSize = uint64(s.Size)
+			// FIX 3 (32-bit): same as build64 — derive BSS size from len(s.Code).
+			d.noSize = uint64(len(s.Code))
 		}
 		descs = append(descs, d)
 	}
