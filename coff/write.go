@@ -6,9 +6,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"strings"
 
-	enc "github.com/vertex-language/encoder"
-	"github.com/vertex-language/ir/mir"
+	"github.com/vertex-language/objectfile/object"
 )
 
 // ── Structure size constants ──────────────────────────────────────────────────
@@ -16,7 +16,7 @@ import (
 const (
 	coffFileHdrSize = 20 // IMAGE_FILE_HEADER
 	coffSecHdrSize  = 40 // IMAGE_SECTION_HEADER
-	coffSymSize     = 18 // IMAGE_SYMBOL  (fixed; AuxiliaryCount always 0)
+	coffSymSize     = 18 // IMAGE_SYMBOL / auxiliary record (same fixed size)
 	coffRelocSize   = 10 // IMAGE_RELOCATION
 )
 
@@ -35,35 +35,34 @@ type coffFileHdr struct {
 }
 
 // coffSecHdr is the 40-byte section header (IMAGE_SECTION_HEADER).
-//
-// For object files VirtualSize and VirtualAddress are 0 for all section kinds
-// except BSS, where VirtualSize carries the uninitialized-data byte count.
+// VirtualSize and VirtualAddress are 0 for all object-file sections.
+// For BSS and zero-TLS, SizeOfRawData carries the virtual reserve size and
+// PointerToRawData is 0.
 type coffSecHdr struct {
-	Name                 [8]byte // inline if ≤8 chars; else "/"+decimal strtab offset
-	VirtualSize          uint32  // 0 for obj (used by loader in images only)
-	VirtualAddress       uint32  // 0 for obj
-	SizeOfRawData        uint32  // bytes of raw data in file; 0 for BSS
-	PointerToRawData     uint32  // file offset of first raw byte; 0 for BSS
-	PointerToRelocations uint32  // file offset of first reloc; 0 if none
-	PointerToLinenumbers uint32  // deprecated; always 0
+	Name                 [8]byte
+	VirtualSize          uint32
+	VirtualAddress       uint32
+	SizeOfRawData        uint32
+	PointerToRawData     uint32
+	PointerToRelocations uint32
+	PointerToLinenumbers uint32
 	NumberOfRelocations  uint16
 	NumberOfLinenumbers  uint16 // deprecated; always 0
 	Characteristics      uint32
 }
 
 // coffReloc is the 10-byte relocation record (IMAGE_RELOCATION).
-// COFF uses implicit addends: no Addend field; the linker reads the addend
-// from the bytes at VirtualAddress inside the section.
+// COFF uses implicit addends: the linker reads the addend from the bytes at
+// VirtualAddress inside the section.
 type coffReloc struct {
-	VirtualAddress   uint32 // byte offset within section
+	VirtualAddress   uint32
 	SymbolTableIndex uint32
 	Type             uint16
 }
 
 // coffSym is the 18-byte symbol table entry (IMAGE_SYMBOL).
-// NumberOfAuxiliarySymbols is always 0; we emit no auxiliary records.
 type coffSym struct {
-	Name                     [8]byte // inline or \0\0\0\0 + strtab offset
+	Name                     [8]byte
 	Value                    uint32
 	SectionNumber            int16
 	Type                     uint16
@@ -77,10 +76,9 @@ const (
 	scnCntCode    uint32 = 0x00000020 // IMAGE_SCN_CNT_CODE
 	scnCntInitDat uint32 = 0x00000040 // IMAGE_SCN_CNT_INITIALIZED_DATA
 	scnCntUninit  uint32 = 0x00000080 // IMAGE_SCN_CNT_UNINITIALIZED_DATA
-	scnAlign1     uint32 = 0x00100000 // IMAGE_SCN_ALIGN_1BYTES
-	scnAlign4     uint32 = 0x00300000 // IMAGE_SCN_ALIGN_4BYTES
-	scnAlign8     uint32 = 0x00400000 // IMAGE_SCN_ALIGN_8BYTES
-	scnAlign16    uint32 = 0x00500000 // IMAGE_SCN_ALIGN_16BYTES
+	scnLnkInfo    uint32 = 0x00000200 // IMAGE_SCN_LNK_INFO  (for .drectve)
+	scnLnkRemove  uint32 = 0x00000800 // IMAGE_SCN_LNK_REMOVE (for .drectve)
+	scnLnkCOMDAT  uint32 = 0x00001000 // IMAGE_SCN_LNK_COMDAT
 	scnMemExec    uint32 = 0x20000000 // IMAGE_SCN_MEM_EXECUTE
 	scnMemRead    uint32 = 0x40000000 // IMAGE_SCN_MEM_READ
 	scnMemWrite   uint32 = 0x80000000 // IMAGE_SCN_MEM_WRITE
@@ -93,107 +91,289 @@ const (
 	symClassStatic   uint8 = 3 // IMAGE_SYM_CLASS_STATIC
 
 	symTypeNull uint16 = 0x0000 // no type info
-	symTypeFunc uint16 = 0x0020 // function (DT_FUNCTION<<4 | T_NULL)
+	symTypeFunc uint16 = 0x0020 // DT_FUNCTION<<4 | T_NULL
 
-	symUndefined int16 = 0 // SHN_UNDEF equivalent
+	symSectionUndef int16 = 0 // undefined / external
 )
+
+// COMDAT selection: IMAGE_COMDAT_SELECT_ANY — linker keeps any one definition.
+const comdatSelectAny uint8 = 2
 
 // ── Relocation type constants ─────────────────────────────────────────────────
 
 // AMD64 (IMAGE_REL_AMD64_*)
 const (
-	relAMD64Addr64   uint16 = 0x0001 // 64-bit VA; 8-byte addend field
+	relAMD64Addr64   uint16 = 0x0001 // 64-bit VA
 	relAMD64Addr32   uint16 = 0x0002 // 32-bit VA
-	relAMD64Addr32NB uint16 = 0x0003 // 32-bit image-relative (no ImageBase added)
-	relAMD64Rel32    uint16 = 0x0004 // 32-bit PC-relative from byte after reloc field
+	relAMD64Addr32NB uint16 = 0x0003 // 32-bit image-relative (IAT)
+	relAMD64Rel32    uint16 = 0x0004 // 32-bit PC-relative
+	relAMD64Secrel   uint16 = 0x000B // 32-bit section-relative (TLS IE)
 )
 
 // ARM64 (IMAGE_REL_ARM64_*)
 const (
 	relARM64Addr32   uint16 = 0x0001 // 32-bit VA
-	relARM64Addr32NB uint16 = 0x0002 // 32-bit image-relative
-	relARM64Branch26 uint16 = 0x0003 // 26-bit PC-relative (BL/B)
-	relARM64Addr64   uint16 = 0x000E // 64-bit VA; 8-byte addend field
+	relARM64Addr32NB uint16 = 0x0002 // 32-bit image-relative (IAT)
+	relARM64Branch26 uint16 = 0x0003 // 26-bit PC-relative B/BL
+	relARM64Secrel   uint16 = 0x0008 // 32-bit section-relative (TLS IE)
+	relARM64Addr64   uint16 = 0x000E // 64-bit VA
 )
 
-// ── Relocation kind → COFF type ───────────────────────────────────────────────
+// ── Relocation-kind translation ───────────────────────────────────────────────
 
-// FIX 1: enc.RelocKind no longer exists; the type now lives in the mir package.
-func (f *File) relocType(k mir.RelocKind) (uint16, error) {
+func (f *File) relocType(k object.RelocKind) (uint16, error) {
 	switch f.machine {
 	case machineAMD64:
 		switch k {
-		case mir.RelocPCRel32:
-			return relAMD64Rel32, nil
-		case mir.RelocAbs64:
+		case object.RelocAbs64:
 			return relAMD64Addr64, nil
-		case mir.RelocAbs32:
+		case object.RelocAbs32:
 			return relAMD64Addr32, nil
-		case mir.RelocIAT:
+		case object.RelocPCRel32:
+			return relAMD64Rel32, nil
+		case object.RelocIAT:
 			return relAMD64Addr32NB, nil
+		case object.RelocTLSIE:
+			return relAMD64Secrel, nil
 		}
 	case machineARM64:
 		switch k {
-		case mir.RelocPCRel26:
-			return relARM64Branch26, nil
-		case mir.RelocAbs64:
+		case object.RelocAbs64:
 			return relARM64Addr64, nil
-		case mir.RelocAbs32:
+		case object.RelocAbs32:
 			return relARM64Addr32, nil
-		case mir.RelocIAT:
+		case object.RelocPCRel26:
+			return relARM64Branch26, nil
+		case object.RelocIAT:
 			return relARM64Addr32NB, nil
+		case object.RelocTLSIE:
+			return relARM64Secrel, nil
 		}
 	}
-	return 0, fmt.Errorf("unsupported relocation kind %v for machine 0x%04X", k, f.machine)
+	return 0, fmt.Errorf("relocation kind %v is not supported for machine 0x%04X", k, f.machine)
 }
 
-// relocAddendSize returns the byte width of the implicit addend field for a
-// given COFF relocation type.  All types use a 4-byte field except the 64-bit
-// absolute address types, which use 8.
+// relocAddendSize returns the byte width of the implicit-addend field.
+// Only 64-bit absolute relocations use an 8-byte field; everything else uses 4.
 func relocAddendSize(t uint16) int {
-	switch t {
-	case relAMD64Addr64, relARM64Addr64:
+	if t == relAMD64Addr64 || t == relARM64Addr64 {
 		return 8
-	default:
-		return 4
 	}
+	return 4
+}
+
+// ── Section naming ────────────────────────────────────────────────────────────
+
+// sectionCOFFName returns the COFF section header name for s.
+//
+// For COMDAT sections (FlagLinkOnce) the first BindingGlobal symbol's name is
+// used directly as the section name so the linker can match definitions across
+// translation units by name (the standard MSVC COMDAT convention).
+func sectionCOFFName(s object.Section) string {
+	if s.Flags&object.FlagLinkOnce != 0 {
+		if key := firstGlobalName(s); key != "" {
+			return key
+		}
+	}
+	return sectionBaseName(s)
+}
+
+func sectionBaseName(s object.Section) string {
+	switch s.Kind {
+	case object.SectionText:
+		return ".text"
+	case object.SectionData:
+		return ".data"
+	case object.SectionROData:
+		return ".rdata"
+	case object.SectionBSS:
+		return ".bss"
+	case object.SectionUnwind:
+		// SectionUnwind maps to .pdata. Callers that also need .xdata should
+		// supply it as a separate SectionCustom section named ".xdata".
+		return ".pdata"
+	case object.SectionInitArray:
+		return ".CRT$XCU"
+	case object.SectionFiniArray:
+		return ".CRT$XTZ"
+	case object.SectionTLS:
+		if len(s.Code) > 0 {
+			return ".tls"
+		}
+		return ".tls$ZZZ"
+	case object.SectionCustom:
+		return s.Custom
+	default:
+		return ".data"
+	}
+}
+
+func firstGlobalName(s object.Section) string {
+	for _, sym := range s.Symbols {
+		if sym.Binding == object.BindingGlobal {
+			return sym.Name
+		}
+	}
+	return ""
+}
+
+// ── Section characteristics ───────────────────────────────────────────────────
+
+// effectiveAlign returns the alignment to use for s, applying a kind-specific
+// default when s.Align is zero.
+func effectiveAlign(s object.Section) uint32 {
+	if s.Align > 0 {
+		return s.Align
+	}
+	switch s.Kind {
+	case object.SectionText:
+		return 16
+	case object.SectionUnwind:
+		return 4
+	case object.SectionCustom:
+		return 1
+	default:
+		return 8
+	}
+}
+
+// alignFlag encodes an alignment value as IMAGE_SCN_ALIGN_* bits (bits 20–23).
+// align must be a power of two in [1, 8192]; values outside this range are
+// clamped.
+func alignFlag(align uint32) uint32 {
+	if align == 0 {
+		align = 1
+	}
+	if align > 8192 {
+		align = 8192
+	}
+	shift := uint32(0)
+	for a := align; a > 1; a >>= 1 {
+		shift++
+	}
+	return (shift + 1) << 20
+}
+
+// sectionChars returns the Characteristics value for s.
+func sectionChars(s object.Section, align uint32) uint32 {
+	var base uint32
+	switch s.Kind {
+	case object.SectionText:
+		base = scnCntCode | scnMemExec | scnMemRead
+	case object.SectionData:
+		base = scnCntInitDat | scnMemRead | scnMemWrite
+	case object.SectionROData:
+		base = scnCntInitDat | scnMemRead
+	case object.SectionBSS:
+		base = scnCntUninit | scnMemRead | scnMemWrite
+	case object.SectionUnwind:
+		base = scnCntInitDat | scnMemRead
+	case object.SectionInitArray, object.SectionFiniArray:
+		base = scnCntInitDat | scnMemRead | scnMemWrite
+	case object.SectionTLS:
+		if len(s.Code) > 0 {
+			base = scnCntInitDat | scnMemRead | scnMemWrite
+		} else {
+			// Zero-fill TLS (.tls$ZZZ): uninitialized, size in SizeOfRawData.
+			base = scnCntUninit | scnMemRead | scnMemWrite
+		}
+	default: // SectionCustom and unknown kinds
+		base = scnCntInitDat | scnMemRead | scnMemWrite
+	}
+	if s.Flags&object.FlagLinkOnce != 0 {
+		base |= scnLnkCOMDAT
+	}
+	base |= alignFlag(align)
+	return base
+}
+
+// isBSSLike reports whether s emits no raw bytes to the file (BSS or zero TLS).
+func isBSSLike(s object.Section) bool {
+	return s.Kind == object.SectionBSS ||
+		(s.Kind == object.SectionTLS && len(s.Code) == 0)
+}
+
+// virtualReserveSize returns the uninitialized-data size for a BSS-like
+// section: s.VSize if set, otherwise len(s.Code).
+func virtualReserveSize(s object.Section) uint32 {
+	if s.VSize > 0 {
+		return uint32(s.VSize)
+	}
+	return uint32(len(s.Code))
 }
 
 // ── Name-encoding helpers ─────────────────────────────────────────────────────
 
-// setSectionName encodes a section name into the 8-byte field of a section
-// header following the COFF object-file rules:
-//   - names ≤ 8 bytes: stored directly, null-padded
-//   - names > 8 bytes: "/" + decimal offset into the string table
-//     (offset measured from the start of the table, i.e. including the 4-byte
-//     size prefix)
-func setSectionName(field *[8]byte, name string, strtab *strTab) {
+// setSectionName encodes a section name into the 8-byte header field.
+// Names ≤ 8 bytes are stored inline (null-padded).
+// Names > 8 bytes use the "/" + decimal-offset convention; the offset is from
+// the start of the string table (including the 4-byte size prefix).
+func setSectionName(field *[8]byte, name string, st *strTab) {
 	if len(name) <= 8 {
 		copy(field[:], name)
 		return
 	}
-	off := strtab.intern(name) + 4 // +4 for the size prefix
-	s := fmt.Sprintf("/%d", off)
-	copy(field[:], s)
+	off := st.intern(name) + 4 // +4 for the size prefix
+	copy(field[:], fmt.Sprintf("/%d", off))
 }
 
-// encodeSymName encodes a symbol name into the 8-byte IMAGE_SYMBOL Name field:
-//   - names ≤ 8 bytes: stored inline, null-padded
-//   - names > 8 bytes: first 4 bytes = \x00\x00\x00\x00, next 4 bytes =
-//     little-endian offset from start of string table (including size prefix)
-func encodeSymName(name string, strtab *strTab) [8]byte {
+// encodeSymName encodes a symbol name into the 8-byte IMAGE_SYMBOL Name field.
+// Names ≤ 8 bytes are stored inline (null-padded).
+// Names > 8 bytes: first 4 bytes = \x00\x00\x00\x00, next 4 bytes =
+// little-endian offset from the start of the string table (including prefix).
+func encodeSymName(name string, st *strTab) [8]byte {
 	var b [8]byte
 	if len(name) <= 8 {
 		copy(b[:], name)
 		return b
 	}
-	off := strtab.intern(name) + 4 // +4 for the size prefix
-	// b[0:4] remain zero — the "use string table" sentinel
+	off := st.intern(name) + 4 // +4 for the size prefix
+	// b[0:4] stay zero — the "use string table" sentinel
 	binary.LittleEndian.PutUint32(b[4:], off)
 	return b
 }
 
-// ── Alignment helpers ─────────────────────────────────────────────────────────
+// ── Symbol-record encoding ────────────────────────────────────────────────────
+
+// symEntry is a single 18-byte slot in the COFF symbol table.
+// Both regular symbols and auxiliary records occupy one slot.
+type symEntry struct {
+	data [coffSymSize]byte
+}
+
+func encodeSymbol(s coffSym) [coffSymSize]byte {
+	var b [coffSymSize]byte
+	le := binary.LittleEndian
+	copy(b[0:8], s.Name[:])
+	le.PutUint32(b[8:], s.Value)
+	le.PutUint16(b[12:], uint16(s.SectionNumber)) // two's-complement reinterpret
+	le.PutUint16(b[14:], s.Type)
+	b[16] = s.StorageClass
+	b[17] = s.NumberOfAuxiliarySymbols
+	return b
+}
+
+// encodeCOMDATAux builds the 18-byte auxiliary section record that must
+// immediately follow the section symbol of a COMDAT section.
+//
+//	Offset  Size  Field
+//	0       4     Length (SizeOfRawData)
+//	4       2     NumberOfRelocations
+//	6       2     NumberOfLinenumbers (0)
+//	8       4     CheckSum (0 for SELECT_ANY)
+//	12      2     Number (0 for SELECT_ANY)
+//	14      1     Selection (IMAGE_COMDAT_SELECT_ANY = 2)
+//	15      3     padding (0)
+func encodeCOMDATAux(rawSize uint32, nRelocs uint16) [coffSymSize]byte {
+	var b [coffSymSize]byte
+	le := binary.LittleEndian
+	le.PutUint32(b[0:], rawSize)
+	le.PutUint16(b[4:], nRelocs)
+	b[14] = comdatSelectAny
+	return b
+}
+
+// ── Layout helpers ────────────────────────────────────────────────────────────
 
 func alignUp(v, a uint32) uint32 {
 	if a <= 1 {
@@ -211,9 +391,9 @@ func padTo(buf *bytes.Buffer, target uint32) {
 // ── Implicit-addend patching ──────────────────────────────────────────────────
 
 // applyImplicitAddends returns a new copy of code with each relocation's
-// Addend written into the appropriate bytes at r.Offset.  The original slice
-// is never modified.  All writes are little-endian.
-func applyImplicitAddends(code []byte, relocs []enc.RelocEntry, rtypes []uint16) []byte {
+// Addend written into the appropriate bytes at r.Offset. The original slice
+// is never modified. All writes are little-endian.
+func applyImplicitAddends(code []byte, relocs []object.Reloc, rtypes []uint16) []byte {
 	if len(relocs) == 0 {
 		return code
 	}
@@ -223,7 +403,7 @@ func applyImplicitAddends(code []byte, relocs []enc.RelocEntry, rtypes []uint16)
 		sz := relocAddendSize(rtypes[i])
 		end := int(r.Offset) + sz
 		if end > len(patched) {
-			// Malformed; build() will have already caught this via relocType.
+			// Malformed offset; relocType validation in build() catches this first.
 			continue
 		}
 		switch sz {
@@ -238,13 +418,21 @@ func applyImplicitAddends(code []byte, relocs []enc.RelocEntry, rtypes []uint16)
 
 // ── External symbol discovery ─────────────────────────────────────────────────
 
-// externalSymbols returns a sorted, deduplicated list of symbol names that
-// appear in relocation entries but are not the name of any input section.
-func externalSymbols(sections []enc.Section) []string {
-	defined := make(map[string]bool, len(sections))
+// definedSymbolNames returns the set of all symbol names defined across all
+// sections' Symbols slices.
+func definedSymbolNames(sections []object.Section) map[string]bool {
+	m := make(map[string]bool)
 	for _, s := range sections {
-		defined[s.Name] = true
+		for _, sym := range s.Symbols {
+			m[sym.Name] = true
+		}
 	}
+	return m
+}
+
+// externalRefs returns a sorted, deduplicated list of symbol names referenced
+// in any section's Relocs but not defined in any section's Symbols.
+func externalRefs(sections []object.Section, defined map[string]bool) []string {
 	seen := make(map[string]bool)
 	for _, s := range sections {
 		for _, r := range s.Relocs {
@@ -253,134 +441,232 @@ func externalSymbols(sections []enc.Section) []string {
 			}
 		}
 	}
-	names := make([]string, 0, len(seen))
+	refs := make([]string, 0, len(seen))
 	for name := range seen {
-		names = append(names, name)
+		refs = append(refs, name)
 	}
-	sort.Strings(names)
-	return names
+	sort.Strings(refs)
+	return refs
+}
+
+// ── .drectve synthesis (DLLExport) ───────────────────────────────────────────
+
+// drectveCharacteristics are the COFF section characteristics for .drectve.
+// IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE | IMAGE_SCN_ALIGN_1BYTES
+const drectveCharacteristics uint32 = scnLnkInfo | scnLnkRemove | (1 << 20)
+
+// buildDrectve returns a synthetic .drectve section for any DLLExport symbols
+// found in sections, or nil if there are none.
+func buildDrectve(sections []object.Section) *object.Section {
+	var exports []string
+	for _, s := range sections {
+		for _, sym := range s.Symbols {
+			if sym.DLLExport {
+				exports = append(exports, sym.Name)
+			}
+		}
+	}
+	if len(exports) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	for _, name := range exports {
+		sb.WriteString(" /EXPORT:")
+		sb.WriteString(name)
+	}
+	return &object.Section{
+		Kind:   object.SectionCustom,
+		Custom: ".drectve",
+		Align:  1,
+		Code:   []byte(sb.String()),
+	}
 }
 
 // ── Main serialisation ────────────────────────────────────────────────────────
 
 func (f *File) build() ([]byte, error) {
 	le := binary.LittleEndian
-	nSec := len(f.sections)
 
-	// ── Phase 1: string table ─────────────────────────────────────────────
-	// Intern all long names eagerly so that the table is stable before we
-	// compute offsets for section/symbol headers.
+	// ── Phase 1: assemble section list ────────────────────────────────────
+	// Append a synthetic .drectve section when DLLExport symbols are present.
 
-	strtab := newStrTab()
-	for _, s := range f.sections {
-		if len(s.Name) > 8 {
-			strtab.intern(s.Name)
+	sections := f.sections
+	if drec := buildDrectve(sections); drec != nil {
+		sections = append(sections, *drec)
+	}
+	nSec := len(sections)
+	if nSec > 0xFFFF {
+		return nil, fmt.Errorf("coff: too many sections (%d > 65535)", nSec)
+	}
+
+	// Validate SectionCustom names.
+	for i, s := range sections {
+		if s.Kind == object.SectionCustom && s.Custom == "" {
+			return nil, fmt.Errorf("coff: section %d: SectionCustom has empty Custom name", i)
 		}
 	}
 
-	// ── Phase 2: section metadata ─────────────────────────────────────────
+	// ── Phase 2: per-section metadata ────────────────────────────────────
 
 	type secMeta struct {
-		chars   uint32 // Characteristics
-		align   uint32 // raw-data file alignment (bytes, power of two)
-		rawSize uint32 // bytes of raw data (0 for BSS)
-		bssSize uint32 // uninitialized-data byte count (SizeOfRawData for BSS)
+		name    string
+		chars   uint32
+		align   uint32
+		rawSize uint32 // bytes written to file (0 for BSS-like sections)
+		resSize uint32 // virtual reservation for BSS-like sections
+		isBSS   bool   // true → no raw bytes; resSize goes in SizeOfRawData
+		isDrv   bool   // true → .drectve; suppress section symbol
 	}
 	meta := make([]secMeta, nSec)
-	for i, s := range f.sections {
-		switch s.Kind {
-		case enc.SectionText:
-			meta[i] = secMeta{
-				chars:   scnCntCode | scnMemExec | scnMemRead | scnAlign16,
-				align:   16,
-				rawSize: uint32(len(s.Code)),
-			}
-		case enc.SectionData:
-			meta[i] = secMeta{
-				chars:   scnCntInitDat | scnMemRead | scnMemWrite | scnAlign8,
-				align:   8,
-				rawSize: uint32(len(s.Code)),
-			}
-		case enc.SectionROData:
-			meta[i] = secMeta{
-				chars:   scnCntInitDat | scnMemRead | scnAlign8,
-				align:   8,
-				rawSize: uint32(len(s.Code)),
-			}
-		case enc.SectionBSS:
-			// FIX 2: encoder.Section.Size was removed; BSS reserve size is
-			// now expressed as len(s.Code), consistent with all other kinds.
-			meta[i] = secMeta{
-				chars:   scnCntUninit | scnMemRead | scnMemWrite | scnAlign8,
-				align:   8,
-				rawSize: 0,
-				bssSize: uint32(len(s.Code)),
-			}
+	for i, s := range sections {
+		align := effectiveAlign(s)
+		isBSS := isBSSLike(s)
+		isDrv := s.Kind == object.SectionCustom && s.Custom == ".drectve"
+
+		var chars uint32
+		if isDrv {
+			chars = drectveCharacteristics
+		} else {
+			chars = sectionChars(s, align)
+		}
+
+		var rawSize, resSize uint32
+		if isBSS {
+			resSize = virtualReserveSize(s)
+		} else {
+			rawSize = uint32(len(s.Code))
+		}
+
+		meta[i] = secMeta{
+			name:    sectionCOFFName(s),
+			chars:   chars,
+			align:   align,
+			rawSize: rawSize,
+			resSize: resSize,
+			isBSS:   isBSS,
+			isDrv:   isDrv,
 		}
 	}
 
-	// ── Phase 3: symbol table ─────────────────────────────────────────────
+	// ── Phase 3: string table ─────────────────────────────────────────────
+	// Pre-intern all long names so that every offset is stable before any
+	// serialisation touches the table.
+
+	st := newStrTab()
+	defined := definedSymbolNames(sections)
+	extRefs := externalRefs(sections, defined)
+
+	for i, s := range sections {
+		if len(meta[i].name) > 8 {
+			st.intern(meta[i].name)
+		}
+		for _, sym := range s.Symbols {
+			if len(sym.Name) > 8 {
+				st.intern(sym.Name)
+			}
+		}
+	}
+	for _, name := range extRefs {
+		if len(name) > 8 {
+			st.intern(name)
+		}
+	}
+
+	// ── Phase 4: symbol table ─────────────────────────────────────────────
 	//
-	// Symbol ordering:
-	//   [0 .. nSec-1]   STB_STATIC section symbols, one per section
-	//   [nSec ..]       IMAGE_SYM_CLASS_EXTERNAL for exported sections
-	//   [after that]    IMAGE_SYM_CLASS_EXTERNAL / undefined for external targets
+	// Slot layout (each slot = 18 bytes, auxiliary records count as slots):
+	//
+	//   [section symbols]
+	//     For each section i:
+	//       slot A: section symbol (IMAGE_SYM_CLASS_STATIC, Value=0)
+	//       slot B: COMDAT aux record (only if FlagLinkOnce)
+	//
+	//   [defined symbols]
+	//     For each section i, for each sym in s.Symbols:
+	//       slot: IMAGE_SYM_CLASS_EXTERNAL (Global/Weak) or STATIC (Local)
+	//
+	//   [undefined externals] — sorted for determinism
+	//     For each name in extRefs not already in symIdx:
+	//       slot: IMAGE_SYM_CLASS_EXTERNAL, SectionNumber=0
 
-	symIdx := make(map[string]uint32, nSec*2)
-	var syms []coffSym
+	var symTable []symEntry
+	symIdx := make(map[string]uint32) // name → slot index in symTable
 
-	// Section symbols (local)
-	for i, s := range f.sections {
-		symIdx[s.Name] = uint32(len(syms))
-		syms = append(syms, coffSym{
-			Name:          encodeSymName(s.Name, strtab),
-			Value:         0,
-			SectionNumber: int16(i + 1), // 1-based
-			Type:          symTypeNull,
-			StorageClass:  symClassStatic,
-		})
-	}
-
-	// Exported (global) symbols
-	for i, s := range f.sections {
-		if !s.Exported {
-			continue
+	// 4a. Section symbols (one per section, + optional COMDAT aux slot).
+	for i, s := range sections {
+		isComdat := s.Flags&object.FlagLinkOnce != 0
+		nAux := uint8(0)
+		if isComdat {
+			nAux = 1
 		}
-		t := symTypeNull
-		if s.Kind == enc.SectionText {
-			t = symTypeFunc
+		secSym := coffSym{
+			Name:                     encodeSymName(meta[i].name, st),
+			Value:                    0,
+			SectionNumber:            int16(i + 1),
+			Type:                     symTypeNull,
+			StorageClass:             symClassStatic,
+			NumberOfAuxiliarySymbols: nAux,
 		}
-		symIdx[s.Name] = uint32(len(syms)) // global overrides section symbol
-		syms = append(syms, coffSym{
-			Name:          encodeSymName(s.Name, strtab),
-			Value:         0,
-			SectionNumber: int16(i + 1),
-			Type:          t,
-			StorageClass:  symClassExternal,
-		})
+		symTable = append(symTable, symEntry{data: encodeSymbol(secSym)})
+		if isComdat {
+			nRelocs := uint16(len(s.Relocs))
+			symTable = append(symTable, symEntry{
+				data: encodeCOMDATAux(meta[i].rawSize, nRelocs),
+			})
+		}
 	}
 
-	// Undefined external symbols (relocation targets not defined locally)
-	for _, name := range externalSymbols(f.sections) {
-		symIdx[name] = uint32(len(syms))
-		syms = append(syms, coffSym{
-			Name:          encodeSymName(name, strtab),
+	// 4b. Defined symbols from each section's Symbols slice.
+	for i, s := range sections {
+		for _, sym := range s.Symbols {
+			idx := uint32(len(symTable))
+			symIdx[sym.Name] = idx
+
+			sc := symClassStatic
+			if sym.Binding == object.BindingGlobal || sym.Binding == object.BindingWeak {
+				sc = symClassExternal
+			}
+			typ := symTypeNull
+			if sym.Kind == object.SymFunc {
+				typ = symTypeFunc
+			}
+			cs := coffSym{
+				Name:          encodeSymName(sym.Name, st),
+				Value:         sym.Offset,
+				SectionNumber: int16(i + 1),
+				Type:          typ,
+				StorageClass:  sc,
+			}
+			symTable = append(symTable, symEntry{data: encodeSymbol(cs)})
+		}
+	}
+
+	// 4c. Undefined externals.
+	for _, name := range extRefs {
+		if _, ok := symIdx[name]; ok {
+			continue // already emitted as a defined symbol
+		}
+		idx := uint32(len(symTable))
+		symIdx[name] = idx
+		cs := coffSym{
+			Name:          encodeSymName(name, st),
 			Value:         0,
-			SectionNumber: symUndefined,
+			SectionNumber: symSectionUndef,
 			Type:          symTypeNull,
 			StorageClass:  symClassExternal,
-		})
+		}
+		symTable = append(symTable, symEntry{data: encodeSymbol(cs)})
 	}
 
-	// ── Phase 4: build relocation records and validate types ──────────────
+	// ── Phase 5: relocation records ───────────────────────────────────────
 
 	type secRelocs struct {
 		records []coffReloc
-		rtypes  []uint16 // parallel to records; needed for addend-size lookup
+		rtypes  []uint16 // parallel to records; drives addend-field size in phase 7
 	}
 	secRel := make([]secRelocs, nSec)
 
-	for i, s := range f.sections {
+	for i, s := range sections {
 		if len(s.Relocs) == 0 {
 			continue
 		}
@@ -389,17 +675,15 @@ func (f *File) build() ([]byte, error) {
 		for _, r := range s.Relocs {
 			si, ok := symIdx[r.Symbol]
 			if !ok {
-				return nil, fmt.Errorf("coff: section %q: relocation symbol %q not in symbol table",
-					s.Name, r.Symbol)
+				return nil, fmt.Errorf("coff: section %q: relocation target %q has no symbol table entry",
+					meta[i].name, r.Symbol)
 			}
 			rt, err := f.relocType(r.Kind)
 			if err != nil {
-				return nil, fmt.Errorf("coff: section %q: %w", s.Name, err)
+				return nil, fmt.Errorf("coff: section %q: %w", meta[i].name, err)
 			}
-			// FIX 3: r.Offset is now int32; cast explicitly to uint32 for
-			// the VirtualAddress field of the COFF relocation record.
 			recs = append(recs, coffReloc{
-				VirtualAddress:   uint32(r.Offset),
+				VirtualAddress:   r.Offset,
 				SymbolTableIndex: si,
 				Type:             rt,
 			})
@@ -408,75 +692,69 @@ func (f *File) build() ([]byte, error) {
 		secRel[i] = secRelocs{records: recs, rtypes: rtyps}
 	}
 
-	// ── Phase 5: file-offset layout ───────────────────────────────────────
+	// ── Phase 6: file-offset layout ───────────────────────────────────────
 	//
-	// The COFF file header (20 bytes) and all section headers (N×40 bytes)
-	// are contiguous at the start of the file.  Section data follows.
-	// Relocations are placed inline after each section's raw bytes.
-	// The symbol table and string table come last.
+	// [ file header ][ section headers ][ raw data + relocs ... ][ sym table ][ strtab ]
 
 	headerEnd := uint32(coffFileHdrSize + nSec*coffSecHdrSize)
 
 	type secLayout struct {
-		rawOff   uint32 // file offset of raw data (0 for BSS)
+		rawOff   uint32 // file offset of raw bytes (0 for BSS-like)
 		relocOff uint32 // file offset of first reloc record (0 if none)
 		nRelocs  uint16
 	}
 	layout := make([]secLayout, nSec)
 
 	pos := headerEnd
-	for i, s := range f.sections {
-		if s.Kind == enc.SectionBSS {
-			// BSS sections occupy no file bytes; both offsets stay zero.
-			continue
+	for i := range sections {
+		if meta[i].isBSS {
+			continue // BSS-like sections occupy no file bytes
 		}
 		pos = alignUp(pos, meta[i].align)
 		layout[i].rawOff = pos
 		pos += meta[i].rawSize
 
 		nr := len(secRel[i].records)
+		if nr > 0xFFFF {
+			return nil, fmt.Errorf("coff: section %q: too many relocations (%d > 65535)",
+				meta[i].name, nr)
+		}
 		if nr > 0 {
-			if nr > 0xFFFF {
-				return nil, fmt.Errorf("coff: section %q: too many relocations (%d > 65535)",
-					s.Name, nr)
-			}
 			layout[i].relocOff = pos
 			layout[i].nRelocs = uint16(nr)
 			pos += uint32(nr) * coffRelocSize
 		}
 	}
 
-	symTabOff := pos // symbol table immediately after last section+relocs
-	strTabOff := symTabOff + uint32(len(syms))*coffSymSize
-	_ = strTabOff // implicit; the writer appends strtab.bytes() at the end
+	symTabOff := pos
 
-	// ── Phase 6: serialise ────────────────────────────────────────────────
+	// ── Phase 7: serialise ────────────────────────────────────────────────
 
 	out := new(bytes.Buffer)
-	out.Grow(int(symTabOff) + len(syms)*coffSymSize + 64) // pre-allocate
+	out.Grow(int(symTabOff) + len(symTable)*coffSymSize + 64)
 
-	// COFF File Header
-	fhdr := coffFileHdr{
+	// COFF file header
+	if err := binary.Write(out, le, coffFileHdr{
 		Machine:              f.machine,
 		NumberOfSections:     uint16(nSec),
 		TimeDateStamp:        0, // zero for reproducible output
 		PointerToSymbolTable: symTabOff,
-		NumberOfSymbols:      uint32(len(syms)),
+		NumberOfSymbols:      uint32(len(symTable)),
 		SizeOfOptionalHeader: 0,
 		Characteristics:      0,
-	}
-	if err := binary.Write(out, le, fhdr); err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("coff: write file header: %w", err)
 	}
 
 	// Section headers
-	for i, s := range f.sections {
+	for i := range sections {
 		var sh coffSecHdr
-		setSectionName(&sh.Name, s.Name, strtab)
+		setSectionName(&sh.Name, meta[i].name, st)
 		sh.Characteristics = meta[i].chars
-		if s.Kind == enc.SectionBSS {
-			// BSS: SizeOfRawData = uninitialized size, PointerToRawData = 0
-			sh.SizeOfRawData = meta[i].bssSize
+		if meta[i].isBSS {
+			// SizeOfRawData carries the virtual reservation size; no raw bytes.
+			sh.SizeOfRawData = meta[i].resSize
+			sh.PointerToRawData = 0
 		} else {
 			sh.SizeOfRawData = meta[i].rawSize
 			sh.PointerToRawData = layout[i].rawOff
@@ -484,39 +762,38 @@ func (f *File) build() ([]byte, error) {
 		sh.PointerToRelocations = layout[i].relocOff
 		sh.NumberOfRelocations = layout[i].nRelocs
 		if err := binary.Write(out, le, sh); err != nil {
-			return nil, fmt.Errorf("coff: write section header %d (%s): %w", i, s.Name, err)
+			return nil, fmt.Errorf("coff: write section header %d (%s): %w",
+				i, meta[i].name, err)
 		}
 	}
 
-	// Section data + inline relocation tables
-	for i, s := range f.sections {
-		if s.Kind == enc.SectionBSS {
+	// Section raw data + inline relocation tables
+	for i, s := range sections {
+		if meta[i].isBSS {
 			continue
 		}
 		padTo(out, layout[i].rawOff)
 
-		// Bake implicit addends into a scratch copy of Code.
+		// Bake implicit addends into a scratch copy of Code before writing.
 		code := applyImplicitAddends(s.Code, s.Relocs, secRel[i].rtypes)
 		out.Write(code)
 
 		for _, r := range secRel[i].records {
 			if err := binary.Write(out, le, r); err != nil {
-				return nil, fmt.Errorf("coff: write reloc for section %s: %w", s.Name, err)
+				return nil, fmt.Errorf("coff: write reloc for section %s: %w",
+					meta[i].name, err)
 			}
 		}
 	}
 
 	// Symbol table
 	padTo(out, symTabOff)
-	for _, sym := range syms {
-		if err := binary.Write(out, le, sym); err != nil {
-			return nil, fmt.Errorf("coff: write symbol %q: %w",
-				string(bytes.TrimRight(sym.Name[:], "\x00")), err)
-		}
+	for _, entry := range symTable {
+		out.Write(entry.data[:])
 	}
 
 	// String table (always present; minimum is 4-byte size-only block)
-	out.Write(strtab.bytes())
+	out.Write(st.bytes())
 
 	return out.Bytes(), nil
 }

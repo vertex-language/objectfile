@@ -2,26 +2,30 @@
 //
 // File layout produced (ET_REL, no program header table):
 //
-//   ┌────────────────────────────────┐
-//   │ ELF header (64 or 52 bytes)   │
-//   ├────────────────────────────────┤
-//   │ .text / .data / .rodata        │  one section per encoder.Section
-//   │ (.bss occupies no file bytes)  │
-//   ├────────────────────────────────┤
-//   │ .rela<name>  …                 │  one SHT_RELA per section with relocs
-//   ├────────────────────────────────┤
-//   │ .symtab                        │
-//   ├────────────────────────────────┤
-//   │ .strtab                        │  symbol name strings
-//   ├────────────────────────────────┤
-//   │ .shstrtab                      │  section name strings
-//   ├────────────────────────────────┤
-//   │ Section header table           │
-//   └────────────────────────────────┘
+//	┌────────────────────────────────┐
+//	│ ELF header (64 or 52 bytes)   │
+//	├────────────────────────────────┤
+//	│ content sections               │
+//	│ (.bss / .tbss: no file bytes)  │
+//	├────────────────────────────────┤
+//	│ .rela<name> …                  │
+//	├────────────────────────────────┤
+//	│ .group …   (COMDAT only)       │
+//	├────────────────────────────────┤
+//	│ .note.GNU-stack  (if enabled)  │
+//	├────────────────────────────────┤
+//	│ .symtab                        │
+//	├────────────────────────────────┤
+//	│ .strtab                        │
+//	├────────────────────────────────┤
+//	│ .shstrtab                      │
+//	├────────────────────────────────┤
+//	│ Section header table           │
+//	└────────────────────────────────┘
 //
-// Symbol table ordering: all STB_LOCAL symbols first (null + section symbols),
-// then STB_GLOBAL symbols (exported + undefined externals). sh_info of .symtab
-// holds the index of the first global.
+// Symbol table ordering: STB_LOCAL symbols first (null + section symbols +
+// local named), then STB_GLOBAL / STB_WEAK. sh_info of .symtab holds the
+// index of the first non-local symbol.
 package elf
 
 import (
@@ -30,16 +34,11 @@ import (
 	"fmt"
 	"sort"
 
-	enc "github.com/vertex-language/encoder"
-	"github.com/vertex-language/ir/mir"
+	"github.com/vertex-language/objectfile/object"
 )
 
 // ── ELF binary structures ─────────────────────────────────────────────────────
-//
-// All fields are naturally aligned; binary.Write produces exactly the byte
-// layout mandated by the ELF specification without any implicit padding.
 
-// elf64Ehdr is the 64-byte ELF64 file header.
 type elf64Ehdr struct {
 	Ident     [16]uint8
 	Type      uint16
@@ -57,7 +56,6 @@ type elf64Ehdr struct {
 	Shstrndx  uint16
 }
 
-// elf64Shdr is the 64-byte ELF64 section header.
 type elf64Shdr struct {
 	Name      uint32
 	Type      uint32
@@ -71,7 +69,6 @@ type elf64Shdr struct {
 	Entsize   uint64
 }
 
-// elf64Sym is the 24-byte ELF64 symbol table entry.
 type elf64Sym struct {
 	Name  uint32
 	Info  uint8
@@ -81,14 +78,12 @@ type elf64Sym struct {
 	Size  uint64
 }
 
-// elf64Rela is the 24-byte ELF64 RELA relocation entry.
 type elf64Rela struct {
 	Offset uint64
 	Info   uint64
 	Addend int64
 }
 
-// elf32Ehdr is the 52-byte ELF32 file header.
 type elf32Ehdr struct {
 	Ident     [16]uint8
 	Type      uint16
@@ -106,7 +101,6 @@ type elf32Ehdr struct {
 	Shstrndx  uint16
 }
 
-// elf32Shdr is the 40-byte ELF32 section header.
 type elf32Shdr struct {
 	Name      uint32
 	Type      uint32
@@ -120,9 +114,7 @@ type elf32Shdr struct {
 	Entsize   uint32
 }
 
-// elf32Sym is the 16-byte ELF32 symbol table entry.
-// Note: ELF32 places Value and Size before Info/Other/Shndx — the opposite
-// of ELF64.
+// elf32Sym: ELF32 places Value and Size before Info/Other/Shndx.
 type elf32Sym struct {
 	Name  uint32
 	Value uint32
@@ -132,31 +124,33 @@ type elf32Sym struct {
 	Shndx uint16
 }
 
-// elf32Rela is the 12-byte ELF32 RELA relocation entry.
 type elf32Rela struct {
 	Offset uint32
 	Info   uint32
 	Addend int32
 }
 
-// ── Section-header constants ──────────────────────────────────────────────────
+// ── Section-header type constants ─────────────────────────────────────────────
 
 const (
-	shtNull     uint32 = 0
-	shtProgBits uint32 = 1
-	shtSymTab   uint32 = 2
-	shtStrTab   uint32 = 3
-	shtRela     uint32 = 4
-	shtNoBits   uint32 = 8
+	shtNull      uint32 = 0
+	shtProgBits  uint32 = 1
+	shtSymTab    uint32 = 2
+	shtStrTab    uint32 = 3
+	shtRela      uint32 = 4
+	shtNoBits    uint32 = 8
+	shtInitArray uint32 = 14
+	shtFiniArray uint32 = 15
+	shtGroup     uint32 = 17
 )
 
+// Section-header flag constants.
 const (
 	shfWrite     uint64 = 0x1
 	shfAlloc     uint64 = 0x2
 	shfExecInstr uint64 = 0x4
-	// shfInfoLink signals that sh_info holds a section header table index.
-	// Required on SHT_RELA sections so the linker can validate cross-references.
-	shfInfoLink uint64 = 0x40
+	shfInfoLink  uint64 = 0x40  // sh_info holds a section index
+	shfTLS       uint64 = 0x400
 )
 
 const (
@@ -169,6 +163,7 @@ const (
 const (
 	stbLocal  uint8 = 0
 	stbGlobal uint8 = 1
+	stbWeak   uint8 = 2
 )
 
 const (
@@ -178,32 +173,54 @@ const (
 	sttSection uint8 = 3
 )
 
-// stInfo packs the binding and type nibbles into st_info.
 func stInfo(bind, typ uint8) uint8 { return (bind << 4) | (typ & 0xF) }
 
 // ── Relocation type numbers ───────────────────────────────────────────────────
 
 // AMD64 (R_X86_64_*)
 const (
-	rX86_64_64       uint32 = 1  // S + A              (absolute 64-bit)
-	rX86_64_PC32     uint32 = 2  // S + A - P          (PC-relative 32-bit)
-	rX86_64_GOTPCREL uint32 = 9  // G + GOT + A - P    (GOT-indirect)
-	rX86_64_32       uint32 = 10 // S + A (zero-extend) (absolute 32-bit)
+	rX86_64_64       uint32 = 1
+	rX86_64_PC32     uint32 = 2
+	rX86_64_PLT32    uint32 = 4
+	rX86_64_GOTPCREL uint32 = 9
+	rX86_64_32       uint32 = 10
+	rX86_64_TLSGD    uint32 = 19
+	rX86_64_GOTTPOFF uint32 = 22
+	rX86_64_TPOFF32  uint32 = 23
 )
 
 // AArch64 (R_AARCH64_*)
 const (
-	rAARCH64_ABS64            uint32 = 257 // S + A         (absolute 64-bit)
-	rAARCH64_CALL26           uint32 = 283 // S + A - P     (BL / B, 26-bit)
-	rAARCH64_ADR_GOT_PAGE     uint32 = 311 // GOT page (pair[0] of GOT reference)
-	rAARCH64_LD64_GOT_LO12_NC uint32 = 312 // GOT offset   (pair[1] of GOT reference)
+	rAARCH64_ABS64                      uint32 = 257
+	rAARCH64_ABS32                      uint32 = 258
+	rAARCH64_ADR_PREL_PG_HI21          uint32 = 275
+	rAARCH64_ADD_ABS_LO12_NC           uint32 = 277
+	rAARCH64_CALL26                     uint32 = 283
+	rAARCH64_ADR_GOT_PAGE              uint32 = 311
+	rAARCH64_LD64_GOT_LO12_NC         uint32 = 312
+	rAARCH64_TLSGD_ADR_PAGE21          uint32 = 513
+	rAARCH64_TLSIE_ADR_GOTTPREL_PAGE21 uint32 = 541
+	rAARCH64_TLSLE_ADD_TPREL_LO12_NC  uint32 = 554
 )
 
 // i386 (R_386_*)
 const (
-	r386_32    uint32 = 1 // S + A    (absolute 32-bit)
-	r386_PC32  uint32 = 2 // S + A - P (PC-relative 32-bit)
-	r386_GOT32 uint32 = 3 // G + A    (GOT-relative)
+	r386_32    uint32 = 1
+	r386_PC32  uint32 = 2
+	r386_GOT32 uint32 = 3
+)
+
+// RISC-V 64 (R_RISCV_*)
+const (
+	rRISCV_32           uint32 = 1
+	rRISCV_64           uint32 = 2
+	rRISCV_CALL_PLT     uint32 = 19
+	rRISCV_TLS_GOT_HI20 uint32 = 21
+	rRISCV_TLS_GD_HI20  uint32 = 22
+	rRISCV_HI20         uint32 = 26
+	rRISCV_LO12_I       uint32 = 27
+	rRISCV_LO12_S       uint32 = 28
+	rRISCV_TPREL_HI20   uint32 = 29
 )
 
 // ── Structure sizes (bytes) ───────────────────────────────────────────────────
@@ -222,8 +239,6 @@ const (
 
 // ── Alignment helpers ─────────────────────────────────────────────────────────
 
-// alignUp rounds v up to the next multiple of a (a must be a power of two,
-// or ≤ 1 to mean "no alignment").
 func alignUp(v, a uint64) uint64 {
 	if a <= 1 {
 		return v
@@ -231,7 +246,6 @@ func alignUp(v, a uint64) uint64 {
 	return (v + a - 1) &^ (a - 1)
 }
 
-// padTo writes zero bytes to buf until buf.Len() equals target.
 func padTo(buf *bytes.Buffer, target uint64) {
 	for uint64(buf.Len()) < target {
 		buf.WriteByte(0)
@@ -243,63 +257,98 @@ func padTo(buf *bytes.Buffer, target uint64) {
 func rinfo64(sym, typ uint32) uint64 { return (uint64(sym) << 32) | uint64(typ) }
 func rinfo32(sym, typ uint32) uint32 { return (sym << 8) | (typ & 0xFF) }
 
-// ── Relocation kind → ELF type number ────────────────────────────────────────
-
-// FIX 1: parameter type is mir.RelocKind, not enc.RelocKind.
-func (f *File) relocType(k mir.RelocKind) (uint32, error) {
-	switch f.machine {
-	case emX86_64:
-		switch k {
-		case mir.RelocPCRel32:
-			return rX86_64_PC32, nil
-		case mir.RelocAbs64:
-			return rX86_64_64, nil
-		case mir.RelocAbs32:
-			return rX86_64_32, nil
-		case mir.RelocGOT:
-			return rX86_64_GOTPCREL, nil
-		}
-	case emAARCH64:
-		switch k {
-		case mir.RelocPCRel26:
-			return rAARCH64_CALL26, nil
-		case mir.RelocAbs64:
-			return rAARCH64_ABS64, nil
-		case mir.RelocGOT:
-			// First half of the two-entry GOT pair.  The ARM64 encoder is
-			// expected to emit a companion RelocEntry with Kind=RelocGOT
-			// immediately after (the linker maps the pair to
-			// ADR_GOT_PAGE + LD64_GOT_LO12_NC).  We handle both uniformly;
-			// the alternating pattern produces the right RELA sequence.
-			return rAARCH64_ADR_GOT_PAGE, nil
-		}
-	case emI386:
-		switch k {
-		case mir.RelocPCRel32:
-			return r386_PC32, nil
-		case mir.RelocAbs32:
-			return r386_32, nil
-		case mir.RelocGOT:
-			return r386_GOT32, nil
-		}
-	}
-	return 0, fmt.Errorf("unsupported relocation kind %v for e_machine %d", k, f.machine)
-}
-
 // ── Internal section descriptor ───────────────────────────────────────────────
 
-// secDesc holds everything needed to emit one section header plus its content.
 type secDesc struct {
 	name    string
 	shType  uint32
 	flags   uint64 // cast to uint32 for 32-bit output
-	link    uint32 // sh_link
-	info    uint32 // sh_info
-	align   uint64 // sh_addralign (0 → not applicable)
-	entSize uint64 // sh_entsize
-	data    []byte // section content; nil for SHT_NOBITS
+	link    uint32
+	info    uint32
+	align   uint64
+	entSize uint64
+	data    []byte
 	noSize  uint64 // sh_size for SHT_NOBITS sections
 	fileOff uint64 // assigned during layout
+}
+
+// ── Section / symbol helpers ──────────────────────────────────────────────────
+
+// elfSectionName returns the canonical ELF section name for a Section.
+func elfSectionName(s object.Section) string {
+	switch s.Kind {
+	case object.SectionText:
+		return ".text"
+	case object.SectionData:
+		return ".data"
+	case object.SectionROData:
+		return ".rodata"
+	case object.SectionBSS:
+		return ".bss"
+	case object.SectionUnwind:
+		return ".eh_frame"
+	case object.SectionInitArray:
+		return ".init_array"
+	case object.SectionFiniArray:
+		return ".fini_array"
+	case object.SectionTLS:
+		if len(s.Code) > 0 {
+			return ".tdata"
+		}
+		return ".tbss"
+	case object.SectionCustom:
+		return s.Custom
+	}
+	return ".unknown"
+}
+
+// elfSymType maps an object.SymbolKind to an ELF st_type nibble.
+func elfSymType(k object.SymbolKind) uint8 {
+	switch k {
+	case object.SymFunc:
+		return sttFunc
+	case object.SymData:
+		return sttObject
+	case object.SymSection:
+		return sttSection
+	}
+	return sttNotype
+}
+
+// sectionVSize returns the virtual size for BSS / zero-fill sections.
+func sectionVSize(s object.Section) uint64 {
+	if s.VSize > 0 {
+		return s.VSize
+	}
+	return uint64(len(s.Code))
+}
+
+// comdatSig returns the symbol-table index of the first global or weak
+// symbol in s, used as the COMDAT group signature.
+func comdatSig(s object.Section, symIndex map[string]uint32, sectionI int) (uint32, error) {
+	for _, sym := range s.Symbols {
+		if sym.Binding == object.BindingGlobal || sym.Binding == object.BindingWeak {
+			if si, ok := symIndex[sym.Name]; ok {
+				return si, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("elf: FlagLinkOnce section %d has no global symbol for COMDAT signature", sectionI)
+}
+
+// buildGroupData assembles the GRP_COMDAT flag word followed by ELF section
+// indices for the content section and its RELA section (if any).
+func buildGroupData(contentELFIdx uint32, relaIdxFor map[int]int, sectionI int, nContent uint32) []byte {
+	members := []uint32{contentELFIdx}
+	if j, ok := relaIdxFor[sectionI]; ok {
+		members = append(members, 1+nContent+uint32(j))
+	}
+	data := make([]byte, 4*(1+len(members)))
+	binary.LittleEndian.PutUint32(data[0:], 1) // GRP_COMDAT
+	for k, m := range members {
+		binary.LittleEndian.PutUint32(data[4+k*4:], m)
+	}
+	return data
 }
 
 // ── 64-bit ELF serialisation ──────────────────────────────────────────────────
@@ -309,49 +358,64 @@ func (f *File) build64() ([]byte, error) {
 
 	// ── Phase 1: symbol table ─────────────────────────────────────────────
 
-	strtab := newStrTab() // symbol name string table
+	strtab := newStrTab()
 	symIndex := make(map[string]uint32)
 	var syms []elf64Sym
 
 	// [0] Mandatory null symbol — all fields zero.
 	syms = append(syms, elf64Sym{})
 
-	// [1..N] One STT_SECTION/STB_LOCAL symbol per input section.
-	// Section content sections start at ELF section index 1.
-	for i, s := range f.sections {
-		idx := uint32(len(syms))
+	// [1..N] One anonymous STT_SECTION/STB_LOCAL symbol per content section.
+	for i := range f.sections {
 		syms = append(syms, elf64Sym{
-			Name:  0, // section symbols are nameless
 			Info:  stInfo(stbLocal, sttSection),
 			Shndx: uint16(1 + i),
 		})
-		symIndex[s.Name] = idx // default: section symbol; may be overridden below
 	}
 
-	// firstGlobal is the index of the first STB_GLOBAL symbol, stored in
-	// .symtab sh_info so the linker can partition the symbol table.
+	// Local named symbols (non-section kind).
+	for i, s := range f.sections {
+		for _, sym := range s.Symbols {
+			if sym.Binding != object.BindingLocal || sym.Kind == object.SymSection {
+				continue
+			}
+			idx := uint32(len(syms))
+			syms = append(syms, elf64Sym{
+				Name:  strtab.intern(sym.Name),
+				Info:  stInfo(stbLocal, elfSymType(sym.Kind)),
+				Shndx: uint16(1 + i),
+				Value: uint64(sym.Offset),
+				Size:  uint64(sym.Size),
+			})
+			symIndex[sym.Name] = idx
+		}
+	}
+
 	firstGlobal := uint32(len(syms))
 
-	// STB_GLOBAL symbols for exported sections.
+	// Global and weak named symbols.
 	for i, s := range f.sections {
-		if !s.Exported {
-			continue
+		for _, sym := range s.Symbols {
+			if sym.Binding == object.BindingLocal {
+				continue
+			}
+			bind := stbGlobal
+			if sym.Binding == object.BindingWeak {
+				bind = stbWeak
+			}
+			idx := uint32(len(syms))
+			syms = append(syms, elf64Sym{
+				Name:  strtab.intern(sym.Name),
+				Info:  stInfo(uint8(bind), elfSymType(sym.Kind)),
+				Shndx: uint16(1 + i),
+				Value: uint64(sym.Offset),
+				Size:  uint64(sym.Size),
+			})
+			symIndex[sym.Name] = idx
 		}
-		symType := sttFunc
-		if s.Kind != enc.SectionText {
-			symType = sttObject
-		}
-		idx := uint32(len(syms))
-		syms = append(syms, elf64Sym{
-			Name:  strtab.intern(s.Name),
-			Info:  stInfo(stbGlobal, symType),
-			Shndx: uint16(1 + i),
-			Size:  uint64(len(s.Code)),
-		})
-		symIndex[s.Name] = idx // global takes priority over section symbol
 	}
 
-	// STB_GLOBAL/SHN_UNDEF symbols for each external relocation target.
+	// SHN_UNDEF entries for external relocation targets.
 	for _, name := range externalSymbols(f.sections) {
 		idx := uint32(len(syms))
 		syms = append(syms, elf64Sym{
@@ -362,7 +426,6 @@ func (f *File) build64() ([]byte, error) {
 		symIndex[name] = idx
 	}
 
-	// Encode symbol table bytes.
 	symBuf := new(bytes.Buffer)
 	for _, sym := range syms {
 		if err := binary.Write(symBuf, le, sym); err != nil {
@@ -372,11 +435,9 @@ func (f *File) build64() ([]byte, error) {
 
 	// ── Phase 2: RELA section data ────────────────────────────────────────
 
-	// FIX 2a: rename local type to relaEntry so it no longer conflicts with
-	// the relaWork variable declared immediately below.
 	type relaEntry struct {
-		contentIdx int    // index into f.sections
-		data       []byte // encoded Elf64_Rela entries
+		contentIdx int
+		data       []byte
 	}
 	var relaWork []relaEntry
 
@@ -388,85 +449,107 @@ func (f *File) build64() ([]byte, error) {
 		for _, r := range s.Relocs {
 			si, ok := symIndex[r.Symbol]
 			if !ok {
-				return nil, fmt.Errorf("elf: section %q: relocation symbol %q not in symbol table",
-					s.Name, r.Symbol)
+				return nil, fmt.Errorf("elf: section %d (%s): relocation symbol %q not in symbol table",
+					i, elfSectionName(s), r.Symbol)
 			}
 			rtype, err := f.relocType(r.Kind)
 			if err != nil {
-				return nil, fmt.Errorf("elf: section %q: %w", s.Name, err)
+				return nil, fmt.Errorf("elf: section %d (%s): %w", i, elfSectionName(s), err)
 			}
-			rela := elf64Rela{
+			if err := binary.Write(buf, le, elf64Rela{
 				Offset: uint64(r.Offset),
 				Info:   rinfo64(si, rtype),
 				Addend: r.Addend,
-			}
-			if err := binary.Write(buf, le, rela); err != nil {
+			}); err != nil {
 				return nil, fmt.Errorf("elf: encode rela: %w", err)
 			}
 		}
-		// FIX 2b: use the renamed relaEntry composite literal.
 		relaWork = append(relaWork, relaEntry{i, buf.Bytes()})
 	}
 
 	// ── Phase 3: section descriptor list ─────────────────────────────────
 
-	// Section indices:
+	// Section index layout:
 	//   0            → NULL
-	//   1..N         → content sections   (N = len(f.sections))
-	//   N+1..N+M     → RELA sections      (M = len(relaWork))
-	//   N+M+1        → .symtab
-	//   N+M+2        → .strtab
-	//   N+M+3        → .shstrtab
+	//   1..N         → content sections        (N = len(f.sections))
+	//   N+1..N+M     → RELA sections           (M = len(relaWork))
+	//   N+M+1..N+M+G → GROUP sections          (G = FlagLinkOnce count)
+	//   N+M+G+1      → .note.GNU-stack         (if gnuStack)
+	//   N+M+G+S+1    → .symtab  (S = gnuStackAdd)
+	//   N+M+G+S+2    → .strtab
+	//   N+M+G+S+3    → .shstrtab
+
 	nContent := uint32(len(f.sections))
 	nRela := uint32(len(relaWork))
-	symtabIdx := 1 + nContent + nRela
+
+	nGroup := uint32(0)
+	for _, s := range f.sections {
+		if s.Flags&object.FlagLinkOnce != 0 {
+			nGroup++
+		}
+	}
+	gnuStackAdd := uint32(0)
+	if f.gnuStack {
+		gnuStackAdd = 1
+	}
+
+	symtabIdx := 1 + nContent + nRela + nGroup + gnuStackAdd
 	strtabIdx := symtabIdx + 1
 	shstrtabIdx := strtabIdx + 1
 
-	shstrtab := newStrTab() // section name string table
-	shstrtab.intern("")     // index 0 = empty
+	// Reverse map: content section index → position in relaWork.
+	relaIdxFor := make(map[int]int, len(relaWork))
+	for j, rw := range relaWork {
+		relaIdxFor[rw.contentIdx] = j
+	}
+
+	shstrtab := newStrTab()
+	shstrtab.intern("") // index 0 = empty name
 
 	var descs []secDesc
+	descs = append(descs, secDesc{shType: shtNull}) // [0] NULL
 
-	// [0] NULL section
-	descs = append(descs, secDesc{name: "", shType: shtNull})
-
-	// [1..N] Content sections
+	// [1..N] Content sections.
 	for _, s := range f.sections {
-		shstrtab.intern(s.Name)
-		d := secDesc{name: s.Name}
+		name := elfSectionName(s)
+		shstrtab.intern(name)
+		d := secDesc{name: name}
 		switch s.Kind {
-		case enc.SectionText:
-			d.shType = shtProgBits
-			d.flags = shfAlloc | shfExecInstr
-			d.align = 16
-			d.data = s.Code
-		case enc.SectionData:
-			d.shType = shtProgBits
-			d.flags = shfAlloc | shfWrite
-			d.align = 8
-			d.data = s.Code
-		case enc.SectionROData:
-			d.shType = shtProgBits
-			d.flags = shfAlloc
-			d.align = 8
-			d.data = s.Code
-		case enc.SectionBSS:
-			d.shType = shtNoBits
-			d.flags = shfAlloc | shfWrite
-			d.align = 8
-			// FIX 3: encoder.Section has no Size field; derive BSS size from
-			// the length of the Code slice (the encoder fills it with zeros
-			// to encode the reservation size).
-			d.noSize = uint64(len(s.Code))
+		case object.SectionText:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc|shfExecInstr, 16, s.Code
+		case object.SectionData:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc|shfWrite, 8, s.Code
+		case object.SectionROData:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc, 8, s.Code
+		case object.SectionBSS:
+			d.shType, d.flags, d.align = shtNoBits, shfAlloc|shfWrite, 8
+			d.noSize = sectionVSize(s)
+		case object.SectionUnwind:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc, 8, s.Code
+		case object.SectionInitArray:
+			d.shType, d.flags, d.align, d.data = shtInitArray, shfAlloc|shfWrite, 8, s.Code
+		case object.SectionFiniArray:
+			d.shType, d.flags, d.align, d.data = shtFiniArray, shfAlloc|shfWrite, 8, s.Code
+		case object.SectionTLS:
+			d.flags, d.align = shfAlloc|shfWrite|shfTLS, 8
+			if len(s.Code) > 0 {
+				d.shType, d.data = shtProgBits, s.Code
+			} else {
+				d.shType, d.noSize = shtNoBits, sectionVSize(s)
+			}
+		case object.SectionCustom:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc, 8, s.Code
+		}
+		if s.Align > 0 {
+			d.align = uint64(s.Align)
 		}
 		descs = append(descs, d)
 	}
 
-	// [N+1..N+M] RELA sections
+	// [N+1..N+M] RELA sections.
 	for _, rw := range relaWork {
 		s := f.sections[rw.contentIdx]
-		nm := ".rela" + s.Name
+		nm := ".rela" + elfSectionName(s)
 		shstrtab.intern(nm)
 		descs = append(descs, secDesc{
 			name:    nm,
@@ -474,13 +557,45 @@ func (f *File) build64() ([]byte, error) {
 			flags:   shfInfoLink,
 			align:   8,
 			link:    symtabIdx,
-			info:    uint32(1 + rw.contentIdx), // section being relocated
+			info:    uint32(1 + rw.contentIdx),
 			entSize: uint64(relaSize64),
 			data:    rw.data,
 		})
 	}
 
-	// [N+M+1] .symtab
+	// [N+M+1..N+M+G] GROUP (COMDAT) sections.
+	for i, s := range f.sections {
+		if s.Flags&object.FlagLinkOnce == 0 {
+			continue
+		}
+		sigIdx, err := comdatSig(s, symIndex, i)
+		if err != nil {
+			return nil, err
+		}
+		shstrtab.intern(".group")
+		descs = append(descs, secDesc{
+			name:    ".group",
+			shType:  shtGroup,
+			align:   4,
+			link:    symtabIdx,
+			info:    sigIdx,
+			entSize: 4,
+			data:    buildGroupData(uint32(1+i), relaIdxFor, i, nContent),
+		})
+	}
+
+	// .note.GNU-stack (if enabled) — empty SHT_PROGBITS, no flags.
+	// Presence without SHF_EXECINSTR signals a non-executable stack to the linker.
+	if f.gnuStack {
+		shstrtab.intern(".note.GNU-stack")
+		descs = append(descs, secDesc{
+			name:   ".note.GNU-stack",
+			shType: shtProgBits,
+			align:  1,
+		})
+	}
+
+	// .symtab
 	shstrtab.intern(".symtab")
 	descs = append(descs, secDesc{
 		name:    ".symtab",
@@ -492,7 +607,7 @@ func (f *File) build64() ([]byte, error) {
 		data:    symBuf.Bytes(),
 	})
 
-	// [N+M+2] .strtab
+	// .strtab
 	shstrtab.intern(".strtab")
 	descs = append(descs, secDesc{
 		name:   ".strtab",
@@ -501,13 +616,13 @@ func (f *File) build64() ([]byte, error) {
 		data:   strtab.bytes(),
 	})
 
-	// [N+M+3] .shstrtab — intern its own name last, then freeze.
+	// .shstrtab — intern its own name last, then freeze.
 	shstrtab.intern(".shstrtab")
 	descs = append(descs, secDesc{
 		name:   ".shstrtab",
 		shType: shtStrTab,
 		align:  1,
-		data:   shstrtab.bytes(), // all names already interned above
+		data:   shstrtab.bytes(),
 	})
 
 	// ── Phase 4: file-offset layout ───────────────────────────────────────
@@ -515,14 +630,14 @@ func (f *File) build64() ([]byte, error) {
 	pos := uint64(ehdrSize64)
 	for i := range descs {
 		if i == 0 {
-			continue // NULL: no file content; fileOff stays 0
+			continue // NULL: no file content
 		}
 		d := &descs[i]
 		if d.shType == shtNoBits {
-			// Conceptual file offset per ELF spec; no bytes written.
+			// Assign a conceptual offset per spec; pos does NOT advance.
 			pos = alignUp(pos, d.align)
 			d.fileOff = pos
-			continue // pos does NOT advance for NOBITS
+			continue
 		}
 		if len(d.data) == 0 {
 			d.fileOff = pos
@@ -532,18 +647,14 @@ func (f *File) build64() ([]byte, error) {
 		d.fileOff = pos
 		pos += uint64(len(d.data))
 	}
-	shoff := alignUp(pos, 8) // section header table: 8-byte aligned
+	shoff := alignUp(pos, 8)
 
 	// ── Phase 5: serialise ────────────────────────────────────────────────
 
 	out := new(bytes.Buffer)
 
-	// ELF64 header
 	var hdr elf64Ehdr
-	hdr.Ident[0] = 0x7F
-	hdr.Ident[1] = 'E'
-	hdr.Ident[2] = 'L'
-	hdr.Ident[3] = 'F'
+	hdr.Ident[0], hdr.Ident[1], hdr.Ident[2], hdr.Ident[3] = 0x7F, 'E', 'L', 'F'
 	hdr.Ident[eiClass] = elfClass64
 	hdr.Ident[eiData] = elfData2LSB
 	hdr.Ident[eiVersion] = evCurrent
@@ -560,7 +671,6 @@ func (f *File) build64() ([]byte, error) {
 		return nil, fmt.Errorf("elf: write ELF64 header: %w", err)
 	}
 
-	// Section content (skip NULL and NOBITS; write the rest with alignment padding)
 	for i := 1; i < len(descs); i++ {
 		d := &descs[i]
 		if d.shType == shtNoBits || len(d.data) == 0 {
@@ -570,11 +680,10 @@ func (f *File) build64() ([]byte, error) {
 		out.Write(d.data)
 	}
 
-	// Section header table
 	padTo(out, shoff)
 	for i, d := range descs {
 		var sh elf64Shdr
-		if i > 0 { // i == 0 → all-zero NULL header
+		if i > 0 {
 			sh.Name = shstrtab.offsets[d.name]
 			sh.Type = d.shType
 			sh.Flags = d.flags
@@ -610,33 +719,53 @@ func (f *File) build32() ([]byte, error) {
 
 	syms = append(syms, elf32Sym{}) // [0] null
 
-	for i, s := range f.sections {
-		idx := uint32(len(syms))
+	for i := range f.sections {
 		syms = append(syms, elf32Sym{
 			Info:  stInfo(stbLocal, sttSection),
 			Shndx: uint16(1 + i),
 		})
-		symIndex[s.Name] = idx
 	}
+
+	for i, s := range f.sections {
+		for _, sym := range s.Symbols {
+			if sym.Binding != object.BindingLocal || sym.Kind == object.SymSection {
+				continue
+			}
+			idx := uint32(len(syms))
+			syms = append(syms, elf32Sym{
+				Name:  strtab.intern(sym.Name),
+				Info:  stInfo(stbLocal, elfSymType(sym.Kind)),
+				Shndx: uint16(1 + i),
+				Value: uint32(sym.Offset),
+				Size:  uint32(sym.Size),
+			})
+			symIndex[sym.Name] = idx
+		}
+	}
+
 	firstGlobal := uint32(len(syms))
 
 	for i, s := range f.sections {
-		if !s.Exported {
-			continue
+		for _, sym := range s.Symbols {
+			if sym.Binding == object.BindingLocal {
+				continue
+			}
+			bind := stbGlobal
+			if sym.Binding == object.BindingWeak {
+				bind = stbWeak
+			}
+			idx := uint32(len(syms))
+			syms = append(syms, elf32Sym{
+				Name:  strtab.intern(sym.Name),
+				Info:  stInfo(uint8(bind), elfSymType(sym.Kind)),
+				Shndx: uint16(1 + i),
+				Value: uint32(sym.Offset),
+				Size:  uint32(sym.Size),
+			})
+			symIndex[sym.Name] = idx
 		}
-		symType := sttFunc
-		if s.Kind != enc.SectionText {
-			symType = sttObject
-		}
-		idx := uint32(len(syms))
-		syms = append(syms, elf32Sym{
-			Name:  strtab.intern(s.Name),
-			Info:  stInfo(stbGlobal, symType),
-			Shndx: uint16(1 + i),
-			Size:  uint32(len(s.Code)),
-		})
-		symIndex[s.Name] = idx
 	}
+
 	for _, name := range externalSymbols(f.sections) {
 		idx := uint32(len(syms))
 		syms = append(syms, elf32Sym{
@@ -656,7 +785,6 @@ func (f *File) build32() ([]byte, error) {
 
 	// ── Phase 2: RELA sections ────────────────────────────────────────────
 
-	// FIX 2a (32-bit): same rename as in build64.
 	type relaEntry struct {
 		contentIdx int
 		data       []byte
@@ -671,23 +799,21 @@ func (f *File) build32() ([]byte, error) {
 		for _, r := range s.Relocs {
 			si, ok := symIndex[r.Symbol]
 			if !ok {
-				return nil, fmt.Errorf("elf: section %q: relocation symbol %q not in symbol table",
-					s.Name, r.Symbol)
+				return nil, fmt.Errorf("elf: section %d (%s): relocation symbol %q not in symbol table",
+					i, elfSectionName(s), r.Symbol)
 			}
 			rtype, err := f.relocType(r.Kind)
 			if err != nil {
-				return nil, fmt.Errorf("elf: section %q: %w", s.Name, err)
+				return nil, fmt.Errorf("elf: section %d (%s): %w", i, elfSectionName(s), err)
 			}
-			rela := elf32Rela{
+			if err := binary.Write(buf, le, elf32Rela{
 				Offset: uint32(r.Offset),
 				Info:   rinfo32(si, rtype),
 				Addend: int32(r.Addend),
-			}
-			if err := binary.Write(buf, le, rela); err != nil {
+			}); err != nil {
 				return nil, fmt.Errorf("elf: encode rela32: %w", err)
 			}
 		}
-		// FIX 2b (32-bit): use the renamed relaEntry composite literal.
 		relaWork = append(relaWork, relaEntry{i, buf.Bytes()})
 	}
 
@@ -695,47 +821,72 @@ func (f *File) build32() ([]byte, error) {
 
 	nContent := uint32(len(f.sections))
 	nRela := uint32(len(relaWork))
-	symtabIdx := 1 + nContent + nRela
+
+	nGroup := uint32(0)
+	for _, s := range f.sections {
+		if s.Flags&object.FlagLinkOnce != 0 {
+			nGroup++
+		}
+	}
+	gnuStackAdd := uint32(0)
+	if f.gnuStack {
+		gnuStackAdd = 1
+	}
+
+	symtabIdx := 1 + nContent + nRela + nGroup + gnuStackAdd
 	strtabIdx := symtabIdx + 1
 	shstrtabIdx := strtabIdx + 1
+
+	relaIdxFor := make(map[int]int, len(relaWork))
+	for j, rw := range relaWork {
+		relaIdxFor[rw.contentIdx] = j
+	}
 
 	shstrtab := newStrTab()
 	shstrtab.intern("")
 
 	var descs []secDesc
-	descs = append(descs, secDesc{name: "", shType: shtNull})
+	descs = append(descs, secDesc{shType: shtNull})
 
 	for _, s := range f.sections {
-		shstrtab.intern(s.Name)
-		d := secDesc{name: s.Name}
+		name := elfSectionName(s)
+		shstrtab.intern(name)
+		d := secDesc{name: name}
 		switch s.Kind {
-		case enc.SectionText:
-			d.shType = shtProgBits
-			d.flags = shfAlloc | shfExecInstr
-			d.align = 16
-			d.data = s.Code
-		case enc.SectionData:
-			d.shType = shtProgBits
-			d.flags = shfAlloc | shfWrite
-			d.align = 4
-			d.data = s.Code
-		case enc.SectionROData:
-			d.shType = shtProgBits
-			d.flags = shfAlloc
-			d.align = 4
-			d.data = s.Code
-		case enc.SectionBSS:
-			d.shType = shtNoBits
-			d.flags = shfAlloc | shfWrite
-			d.align = 4
-			// FIX 3 (32-bit): same as build64 — derive BSS size from len(s.Code).
-			d.noSize = uint64(len(s.Code))
+		case object.SectionText:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc|shfExecInstr, 16, s.Code
+		case object.SectionData:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc|shfWrite, 4, s.Code
+		case object.SectionROData:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc, 4, s.Code
+		case object.SectionBSS:
+			d.shType, d.flags, d.align = shtNoBits, shfAlloc|shfWrite, 4
+			d.noSize = sectionVSize(s)
+		case object.SectionUnwind:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc, 4, s.Code
+		case object.SectionInitArray:
+			d.shType, d.flags, d.align, d.data = shtInitArray, shfAlloc|shfWrite, 4, s.Code
+		case object.SectionFiniArray:
+			d.shType, d.flags, d.align, d.data = shtFiniArray, shfAlloc|shfWrite, 4, s.Code
+		case object.SectionTLS:
+			d.flags, d.align = shfAlloc|shfWrite|shfTLS, 4
+			if len(s.Code) > 0 {
+				d.shType, d.data = shtProgBits, s.Code
+			} else {
+				d.shType, d.noSize = shtNoBits, sectionVSize(s)
+			}
+		case object.SectionCustom:
+			d.shType, d.flags, d.align, d.data = shtProgBits, shfAlloc, 4, s.Code
+		}
+		if s.Align > 0 {
+			d.align = uint64(s.Align)
 		}
 		descs = append(descs, d)
 	}
+
 	for _, rw := range relaWork {
 		s := f.sections[rw.contentIdx]
-		nm := ".rela" + s.Name
+		nm := ".rela" + elfSectionName(s)
 		shstrtab.intern(nm)
 		descs = append(descs, secDesc{
 			name:    nm,
@@ -748,6 +899,36 @@ func (f *File) build32() ([]byte, error) {
 			data:    rw.data,
 		})
 	}
+
+	for i, s := range f.sections {
+		if s.Flags&object.FlagLinkOnce == 0 {
+			continue
+		}
+		sigIdx, err := comdatSig(s, symIndex, i)
+		if err != nil {
+			return nil, err
+		}
+		shstrtab.intern(".group")
+		descs = append(descs, secDesc{
+			name:    ".group",
+			shType:  shtGroup,
+			align:   4,
+			link:    symtabIdx,
+			info:    sigIdx,
+			entSize: 4,
+			data:    buildGroupData(uint32(1+i), relaIdxFor, i, nContent),
+		})
+	}
+
+	if f.gnuStack {
+		shstrtab.intern(".note.GNU-stack")
+		descs = append(descs, secDesc{
+			name:   ".note.GNU-stack",
+			shType: shtProgBits,
+			align:  1,
+		})
+	}
+
 	shstrtab.intern(".symtab")
 	descs = append(descs, secDesc{
 		name:    ".symtab",
@@ -758,6 +939,7 @@ func (f *File) build32() ([]byte, error) {
 		entSize: uint64(symSize32),
 		data:    symBuf.Bytes(),
 	})
+
 	shstrtab.intern(".strtab")
 	descs = append(descs, secDesc{
 		name:   ".strtab",
@@ -765,6 +947,7 @@ func (f *File) build32() ([]byte, error) {
 		align:  1,
 		data:   strtab.bytes(),
 	})
+
 	shstrtab.intern(".shstrtab")
 	descs = append(descs, secDesc{
 		name:   ".shstrtab",
@@ -801,10 +984,7 @@ func (f *File) build32() ([]byte, error) {
 	out := new(bytes.Buffer)
 
 	var hdr elf32Ehdr
-	hdr.Ident[0] = 0x7F
-	hdr.Ident[1] = 'E'
-	hdr.Ident[2] = 'L'
-	hdr.Ident[3] = 'F'
+	hdr.Ident[0], hdr.Ident[1], hdr.Ident[2], hdr.Ident[3] = 0x7F, 'E', 'L', 'F'
 	hdr.Ident[eiClass] = elfClass32
 	hdr.Ident[eiData] = elfData2LSB
 	hdr.Ident[eiVersion] = evCurrent
@@ -859,17 +1039,19 @@ func (f *File) build32() ([]byte, error) {
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 // externalSymbols returns a sorted, deduplicated list of symbol names that
-// appear in relocation entries across all sections but are not themselves
-// the name of any input section (i.e. they require SHN_UNDEF entries).
-func externalSymbols(sections []enc.Section) []string {
-	defined := make(map[string]bool, len(sections))
+// appear in relocation records but are not defined in any section's Symbols
+// slice — i.e. they require SHN_UNDEF entries.
+func externalSymbols(sections []object.Section) []string {
+	defined := make(map[string]bool)
 	for _, s := range sections {
-		defined[s.Name] = true
+		for _, sym := range s.Symbols {
+			defined[sym.Name] = true
+		}
 	}
 	seen := make(map[string]bool)
 	for _, s := range sections {
 		for _, r := range s.Relocs {
-			if !defined[r.Symbol] {
+			if r.Symbol != "" && !defined[r.Symbol] {
 				seen[r.Symbol] = true
 			}
 		}

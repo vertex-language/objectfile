@@ -1,36 +1,20 @@
 // write.go — Mach-O MH_OBJECT serialisation.
 //
-// File layout (all offsets from start of file):
-//
-//   mach_header_64                                    32 bytes
-//   LC_SEGMENT_64  (+ N × section_64)                72 + N×80 bytes
-//   LC_BUILD_VERSION (if configured)                 24 bytes
-//   LC_SYMTAB                                        24 bytes
-//   ── section data region ──
-//   section[0] raw bytes  (aligned)
-//   section[0] reloc_info[]   (8 bytes each)
-//   section[1] raw bytes
-//   section[1] reloc_info[]
-//   …
-//   ── symbol & string tables ──
-//   nlist_64[]            (16 bytes each)
-//   string table          (null-terminated strings)
-//
-// Addend convention (implicit addends, like COFF):
-//   Mach-O stores no addend in the relocation record.  Instead the linker
-//   reads the addend from the instruction bytes at r_address.  Serialize
-//   therefore writes RelocEntry.Addend into Code[r.Offset:] before emitting
-//   each section's raw bytes.
-//
 // Symbol table ordering required by the static linker:
-//   [0]        mandatory null / empty symbol
-//   [1..nSec]  one N_SECT/N_EXT=0 (local) section-symbol per section
-//   [nSec+1..] N_SECT/N_EXT=1 (external/global) symbols for exported sections
-//   [last..]   N_UNDF/N_EXT=1 (undefined external) symbols for reloc targets
+//   [0]          mandatory null symbol
+//   [1..nSec]    one anonymous N_SECT (local) section-symbol per section
+//   [nSec+1..]   BindingLocal symbols from s.Symbols, in section order
+//   [..]         BindingGlobal / BindingWeak symbols from s.Symbols
+//   [last..]     N_UNDF/N_EXT undefined-external symbols for unresolved reloc targets
 //
-// r_symbolnum:
-//   r_extern=1 → index into the nlist_64 symbol table (0-based)
-//   r_extern=0 → 1-based section index (for local symbols)
+// r_extern / r_symbolnum encoding:
+//   BindingLocal target         → r_extern=0, r_symbolnum = 1-based section index
+//   BindingGlobal/Weak target   → r_extern=1, r_symbolnum = nlist index
+//   undefined target            → r_extern=1, r_symbolnum = nlist index
+//
+// Implicit-addend convention:
+//   Reloc.Addend is written into Code[r.Offset:] (little-endian, 4 or 8 bytes)
+//   before the section bytes are emitted.  The relocation record carries zero.
 package macho
 
 import (
@@ -38,9 +22,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"strings"
 
-	enc "github.com/vertex-language/encoder"
-	"github.com/vertex-language/ir/mir"
+	"github.com/vertex-language/objectfile/object"
 )
 
 // ── Structure sizes ───────────────────────────────────────────────────────────
@@ -81,20 +65,23 @@ const (
 	sTypeZerofill         uint32 = 0x1
 )
 
-// ── nlist_64 type / binding nibbles ──────────────────────────────────────────
+// ── nlist_64 type / binding bits ──────────────────────────────────────────────
 
 const (
 	nUndf uint8 = 0x00 // N_UNDF: undefined
 	nSect uint8 = 0x0E // N_SECT: defined in a section
 	nExt  uint8 = 0x01 // N_EXT: external (global) bit
-	nPExt uint8 = 0x10 // N_PEXT: private external (not used here)
+)
+
+// nlist_64 n_desc flags
+const (
+	nWeakDef uint16 = 0x0080 // N_WEAK_DEF: weak definition (FlagLinkOnce / BindingWeak)
 )
 
 const noSect uint8 = 0 // NO_SECT
 
 // ── Binary structures ─────────────────────────────────────────────────────────
 
-// machHeader64 mirrors mach_header_64 from <mach-o/loader.h>.
 type machHeader64 struct {
 	Magic      uint32
 	CPUType    int32
@@ -106,7 +93,6 @@ type machHeader64 struct {
 	Reserved   uint32
 }
 
-// segmentCommand64 mirrors segment_command_64.
 type segmentCommand64 struct {
 	Cmd      uint32
 	CmdSize  uint32
@@ -121,14 +107,13 @@ type segmentCommand64 struct {
 	Flags    uint32
 }
 
-// section64 mirrors section_64.
 type section64 struct {
 	SectName  [16]byte
 	SegName   [16]byte
 	Addr      uint64
 	Size      uint64
 	Offset    uint32 // file offset; 0 for zerofill
-	Align     uint32 // power of 2
+	Align     uint32 // log2 of byte alignment
 	RelOff    uint32 // file offset of relocation entries; 0 if none
 	NReloc    uint32
 	Flags     uint32
@@ -137,41 +122,37 @@ type section64 struct {
 	Reserved3 uint32
 }
 
-// symtabCommand mirrors symtab_command.
 type symtabCommand struct {
 	Cmd     uint32
 	CmdSize uint32
-	SymOff  uint32 // file offset of nlist_64 array
+	SymOff  uint32
 	NSyms   uint32
-	StrOff  uint32 // file offset of string table
+	StrOff  uint32
 	StrSize uint32
 }
 
-// buildVersionCommand mirrors build_version_command (ntools=0 variant).
 type buildVersionCommand struct {
 	Cmd      uint32
 	CmdSize  uint32
 	Platform uint32
-	MinOS    uint32 // X.Y.Z packed as (X<<16)|(Y<<8)|Z
-	SDK      uint32 // same packing
-	NTools   uint32 // 0 — no tool version entries follow
+	MinOS    uint32
+	SDK      uint32
+	NTools   uint32
 }
 
-// nlist64 mirrors nlist_64 from <mach-o/nlist.h>.
 type nlist64 struct {
-	NStrx  uint32 // index into string table
-	NType  uint8  // type flags (N_TYPE + N_EXT etc.)
-	NSect  uint8  // section number (1-based) or NO_SECT
-	NDesc  uint16 // reference / stab flags
-	NValue uint64 // symbol value (address or 0 for undef)
+	NStrx  uint32
+	NType  uint8
+	NSect  uint8
+	NDesc  uint16
+	NValue uint64
 }
 
-// relocInfo mirrors relocation_info from <mach-o/reloc.h>.
-// The r_symbolnum, r_pcrel, r_length, r_extern, r_type bitfields are packed
-// into a single uint32 in little-endian order.
+// relocInfo mirrors relocation_info.  The r_symbolnum/r_pcrel/r_length/
+// r_extern/r_type bitfields are packed into RInfo (little-endian).
 type relocInfo struct {
-	RAddress uint32 // byte offset within section
-	RInfo    uint32 // packed: symbolnum[23:0] | pcrel[24] | length[26:25] | extern[27] | type[31:28]
+	RAddress uint32
+	RInfo    uint32
 }
 
 // ── relocInfo packing ─────────────────────────────────────────────────────────
@@ -192,28 +173,30 @@ func packRelocInfo(symbolNum uint32, pcrel bool, length uint8, extern bool, rtyp
 
 // ── Relocation type constants ─────────────────────────────────────────────────
 
-// x86-64 Mach-O relocation types (r_type field, 4 bits).
+// x86-64 Mach-O relocation types (r_type, 4 bits).
 const (
-	x86_64RelocUnsigned uint8 = 0 // absolute 64-bit address
-	x86_64RelocSigned   uint8 = 1 // 32-bit signed PC-relative displacement (generic)
-	x86_64RelocBranch   uint8 = 2 // 32-bit PC-relative (CALL/JMP)
-	x86_64RelocGOTLoad  uint8 = 3 // MOVQ load of a GOT entry
-	x86_64RelocGOT      uint8 = 4 // other GOT reference
+	x86_64RelocUnsigned uint8 = 0 // X86_64_RELOC_UNSIGNED  — absolute 64-bit
+	x86_64RelocSigned   uint8 = 1 // X86_64_RELOC_SIGNED    — 32-bit PC-relative (generic)
+	x86_64RelocBranch   uint8 = 2 // X86_64_RELOC_BRANCH    — 32-bit PC-relative CALL/JMP
+	x86_64RelocGOTLoad  uint8 = 3 // X86_64_RELOC_GOT_LOAD  — MOVQ load of GOT entry
+	x86_64RelocGOT      uint8 = 4 // X86_64_RELOC_GOT       — other GOT reference
+	x86_64RelocTLV      uint8 = 9 // X86_64_RELOC_TLV       — TLV descriptor access
 )
 
 // ARM64 Mach-O relocation types.
 const (
-	arm64RelocUnsigned         uint8 = 0 // absolute (pointer-sized)
-	arm64RelocSubtractor       uint8 = 1 // must be followed by ARM64_RELOC_UNSIGNED
-	arm64RelocBranch26         uint8 = 2 // BL/B  26-bit PC-relative
-	arm64RelocPage21           uint8 = 3 // ADR page21
-	arm64RelocPageoff12        uint8 = 4 // page offset12
-	arm64RelocGOTLoadPage21    uint8 = 5 // ADR GOT page21
-	arm64RelocGOTLoadPageoff12 uint8 = 6 // GOT page offset12
+	arm64RelocUnsigned          uint8 = 0 // ARM64_RELOC_UNSIGNED
+	arm64RelocSubtractor        uint8 = 1 // ARM64_RELOC_SUBTRACTOR
+	arm64RelocBranch26          uint8 = 2 // ARM64_RELOC_BRANCH26        — BL/B
+	arm64RelocPage21            uint8 = 3 // ARM64_RELOC_PAGE21          — ADRP
+	arm64RelocPageoff12         uint8 = 4 // ARM64_RELOC_PAGEOFF12       — ADD/LDR page offset
+	arm64RelocGOTLoadPage21     uint8 = 5 // ARM64_RELOC_GOT_LOAD_PAGE21
+	arm64RelocGOTLoadPageoff12  uint8 = 6 // ARM64_RELOC_GOT_LOAD_PAGEOFF12
+	arm64RelocTLVPLoadPage21    uint8 = 7 // ARM64_RELOC_TLVP_LOAD_PAGE21
+	arm64RelocTLVPLoadPageoff12 uint8 = 8 // ARM64_RELOC_TLVP_LOAD_PAGEOFF12
 )
 
-// ── r_length encoding ─────────────────────────────────────────────────────────
-// r_length encodes the byte width of the relocated field as log2:
+// r_length: log2 of the byte width of the relocated field.
 //
 //	0 → 1 byte, 1 → 2 bytes, 2 → 4 bytes, 3 → 8 bytes
 const (
@@ -238,7 +221,7 @@ func padTo(buf *bytes.Buffer, target uint32) {
 	}
 }
 
-// ── Relocation kind → Mach-O type ────────────────────────────────────────────
+// ── Relocation kind → Mach-O descriptor ──────────────────────────────────────
 
 type relocDesc struct {
 	rtype  uint8
@@ -246,29 +229,35 @@ type relocDesc struct {
 	pcrel  bool
 }
 
-// FIX 1: enc.RelocKind → mir.RelocKind; the kind lives in the mir package.
-func (f *File) relocDesc(k mir.RelocKind) (relocDesc, error) {
+func (f *File) relocDesc(k object.RelocKind) (relocDesc, error) {
 	switch f.cpuType {
 	case cpuTypeX86_64:
 		switch k {
-		case mir.RelocPCRel32:
-			return relocDesc{x86_64RelocBranch, rLength4, true}, nil
-		case mir.RelocAbs64:
+		case object.RelocAbs64:
 			return relocDesc{x86_64RelocUnsigned, rLength8, false}, nil
-		case mir.RelocGOT:
+		case object.RelocPCRel32:
+			return relocDesc{x86_64RelocBranch, rLength4, true}, nil
+		case object.RelocGOTLoad:
 			return relocDesc{x86_64RelocGOTLoad, rLength4, true}, nil
+		case object.RelocTLSGD:
+			return relocDesc{x86_64RelocTLV, rLength4, true}, nil
 		}
 	case cpuTypeARM64:
 		switch k {
-		case mir.RelocPCRel26:
-			return relocDesc{arm64RelocBranch26, rLength4, true}, nil
-		case mir.RelocAbs64:
+		case object.RelocAbs64:
 			return relocDesc{arm64RelocUnsigned, rLength8, false}, nil
-		case mir.RelocGOT:
-			// First half of the GOT pair (GOT_LOAD_PAGE21); the encoder is
-			// expected to emit a companion entry immediately after this one
-			// (GOT_LOAD_PAGEOFF12) as required by the ARM64 ABI.
+		case object.RelocPCRel26:
+			return relocDesc{arm64RelocBranch26, rLength4, true}, nil
+		case object.RelocADRPage21:
+			return relocDesc{arm64RelocPage21, rLength4, true}, nil
+		case object.RelocAddOff12:
+			return relocDesc{arm64RelocPageoff12, rLength4, false}, nil
+		case object.RelocGOTPage21:
 			return relocDesc{arm64RelocGOTLoadPage21, rLength4, true}, nil
+		case object.RelocGOTOff12:
+			return relocDesc{arm64RelocGOTLoadPageoff12, rLength4, false}, nil
+		case object.RelocTLSGD:
+			return relocDesc{arm64RelocTLVPLoadPage21, rLength4, true}, nil
 		}
 	}
 	return relocDesc{}, fmt.Errorf("macho: unsupported relocation kind %v for cpu_type 0x%08X",
@@ -277,8 +266,7 @@ func (f *File) relocDesc(k mir.RelocKind) (relocDesc, error) {
 
 // ── Implicit-addend patching ──────────────────────────────────────────────────
 
-// addendSize returns the byte width of the implicit addend field for a given
-// relocation descriptor.  All PCrel/32-bit types use 4 bytes; abs64 uses 8.
+// addendSize returns the byte width of the implicit addend field.
 func addendSize(rd relocDesc) int {
 	if rd.length == rLength8 {
 		return 8
@@ -287,8 +275,8 @@ func addendSize(rd relocDesc) int {
 }
 
 // applyImplicitAddends returns a copy of code with each relocation's addend
-// baked into the appropriate bytes at r.Offset (little-endian).
-func applyImplicitAddends(code []byte, relocs []enc.RelocEntry, descs []relocDesc) []byte {
+// written into the appropriate bytes at r.Offset (little-endian).
+func applyImplicitAddends(code []byte, relocs []object.Reloc, descs []relocDesc) []byte {
 	if len(relocs) == 0 {
 		return code
 	}
@@ -299,7 +287,7 @@ func applyImplicitAddends(code []byte, relocs []enc.RelocEntry, descs []relocDes
 		sz := addendSize(descs[i])
 		end := int(r.Offset) + sz
 		if end > len(patched) {
-			continue // malformed; relocDesc lookup already caught the kind error
+			continue // malformed input; kind error already caught in Phase 1
 		}
 		switch sz {
 		case 8:
@@ -313,15 +301,21 @@ func applyImplicitAddends(code []byte, relocs []enc.RelocEntry, descs []relocDes
 
 // ── External symbol discovery ─────────────────────────────────────────────────
 
-func externalSymbols(sections []enc.Section) []string {
-	defined := make(map[string]bool, len(sections))
+// externalSymbols returns a sorted list of symbol names that are referenced
+// by relocations but not defined in any section's Symbols slice.
+func externalSymbols(sections []object.Section) []string {
+	defined := make(map[string]bool)
 	for _, s := range sections {
-		defined[s.Name] = true
+		for _, sym := range s.Symbols {
+			if sym.Name != "" {
+				defined[sym.Name] = true
+			}
+		}
 	}
 	seen := make(map[string]bool)
 	for _, s := range sections {
 		for _, r := range s.Relocs {
-			if !defined[r.Symbol] {
+			if r.Symbol != "" && !defined[r.Symbol] {
 				seen[r.Symbol] = true
 			}
 		}
@@ -332,6 +326,142 @@ func externalSymbols(sections []enc.Section) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// ── Section metadata ──────────────────────────────────────────────────────────
+
+type secMeta struct {
+	segName    string
+	sectName   string
+	flags      uint32
+	align      uint32 // alignment in bytes (value, not log2)
+	rawSize    uint32 // bytes of content in the file (0 for zerofill)
+	bssSize    uint64 // virtual zero-fill byte count (zerofill sections only)
+	isZerofill bool
+}
+
+// sectionMeta computes the Mach-O section descriptor for section i.
+func sectionMeta(i int, s object.Section) (secMeta, error) {
+	// ea returns s.Align when set, otherwise the format default.
+	ea := func(dflt uint32) uint32 {
+		if s.Align > 0 {
+			return s.Align
+		}
+		return dflt
+	}
+
+	// zerofillSize picks VSize when non-zero, else falls back to len(Code).
+	zerofillSize := func() uint64 {
+		if s.VSize > 0 {
+			return s.VSize
+		}
+		return uint64(len(s.Code))
+	}
+
+	switch s.Kind {
+	case object.SectionText:
+		return secMeta{
+			segName:  "__TEXT",
+			sectName: "__text",
+			flags:    sAttrPureInstructions | sAttrSomeInstructions,
+			align:    ea(16),
+			rawSize:  uint32(len(s.Code)),
+		}, nil
+
+	case object.SectionData:
+		return secMeta{
+			segName:  "__DATA",
+			sectName: "__data",
+			flags:    sTypeRegular,
+			align:    ea(8),
+			rawSize:  uint32(len(s.Code)),
+		}, nil
+
+	case object.SectionROData:
+		return secMeta{
+			segName:  "__TEXT",
+			sectName: "__const",
+			flags:    sTypeRegular,
+			align:    ea(8),
+			rawSize:  uint32(len(s.Code)),
+		}, nil
+
+	case object.SectionBSS:
+		return secMeta{
+			segName:    "__DATA",
+			sectName:   "__bss",
+			flags:      sTypeZerofill,
+			align:      ea(8),
+			bssSize:    zerofillSize(),
+			isZerofill: true,
+		}, nil
+
+	case object.SectionUnwind:
+		// Compact unwind records.  Callers that also need __eh_frame should
+		// supply a SectionCustom("__TEXT,__eh_frame") section separately.
+		return secMeta{
+			segName:  "__TEXT",
+			sectName: "__unwind_info",
+			flags:    sTypeRegular,
+			align:    ea(4),
+			rawSize:  uint32(len(s.Code)),
+		}, nil
+
+	case object.SectionInitArray:
+		return secMeta{
+			segName:  "__DATA",
+			sectName: "__mod_init_func",
+			flags:    sTypeRegular,
+			align:    ea(8),
+			rawSize:  uint32(len(s.Code)),
+		}, nil
+
+	case object.SectionFiniArray:
+		return secMeta{
+			segName:  "__DATA",
+			sectName: "__mod_term_func",
+			flags:    sTypeRegular,
+			align:    ea(8),
+			rawSize:  uint32(len(s.Code)),
+		}, nil
+
+	case object.SectionTLS:
+		if len(s.Code) > 0 {
+			return secMeta{
+				segName:  "__DATA",
+				sectName: "__thread_data",
+				flags:    sTypeRegular,
+				align:    ea(8),
+				rawSize:  uint32(len(s.Code)),
+			}, nil
+		}
+		return secMeta{
+			segName:    "__DATA",
+			sectName:   "__thread_bss",
+			flags:      sTypeZerofill,
+			align:      ea(8),
+			bssSize:    zerofillSize(),
+			isZerofill: true,
+		}, nil
+
+	case object.SectionCustom:
+		comma := strings.IndexByte(s.Custom, ',')
+		if comma < 0 {
+			return secMeta{}, fmt.Errorf(
+				"macho: section[%d] SectionCustom: expected \"segment,section\" format, got %q",
+				i, s.Custom)
+		}
+		return secMeta{
+			segName:  s.Custom[:comma],
+			sectName: s.Custom[comma+1:],
+			flags:    sTypeRegular,
+			align:    ea(1),
+			rawSize:  uint32(len(s.Code)),
+		}, nil
+
+	default:
+		return secMeta{}, fmt.Errorf("macho: section[%d]: unknown SectionKind %d", i, s.Kind)
+	}
 }
 
 // ── Main serialisation ────────────────────────────────────────────────────────
@@ -352,59 +482,101 @@ func (f *File) build() ([]byte, error) {
 		if len(s.Relocs) == 0 {
 			continue
 		}
-		// symbol index map is not yet built; we fill r_symbolnum in Phase 3.
 		descs := make([]relocDesc, len(s.Relocs))
 		for j, r := range s.Relocs {
 			rd, err := f.relocDesc(r.Kind)
 			if err != nil {
-				return nil, fmt.Errorf("macho: section %q reloc[%d]: %w", s.Name, j, err)
+				return nil, fmt.Errorf("macho: section[%d] reloc[%d]: %w", i, j, err)
 			}
 			descs[j] = rd
 		}
 		secRel[i].descs = descs
 	}
 
-	// ── Phase 2: symbol table ─────────────────────────────────────────────
+	// ── Phase 2: section metadata ─────────────────────────────────────────
+
+	meta := make([]secMeta, nSec)
+	for i, s := range f.sections {
+		m, err := sectionMeta(i, s)
+		if err != nil {
+			return nil, err
+		}
+		meta[i] = m
+	}
+
+	// ── Phase 3: symbol table ─────────────────────────────────────────────
+	//
+	// symEntry records what we need to resolve r_extern / r_symbolnum for
+	// each relocation target.
+	type symEntry struct {
+		nlistIdx uint32
+		sectIdx  int            // 0-based section index; -1 for undefined externals
+		binding  object.Binding
+	}
+	symDefs := make(map[string]symEntry)
 
 	strtab := newStrTab()
-	symIdx := make(map[string]uint32)
 	var syms []nlist64
 
 	// [0] mandatory null symbol
 	syms = append(syms, nlist64{})
 
-	// [1..nSec] one local (N_SECT, !N_EXT) section symbol per section.
-	// These are used by local (r_extern=0) relocations when the relocation
-	// target is within the same object.
-	for i, s := range f.sections {
-		idx := uint32(len(syms))
-		// Section symbols get the name "_<sectname>" stripped — they are
-		// anonymous in Mach-O; n_strx=0 (empty) is conventional.
+	// [1..nSec] one anonymous local section-symbol per section (strx=0).
+	// Used as the r_symbolnum target for section-relative (r_extern=0) relocs.
+	for i := range f.sections {
 		syms = append(syms, nlist64{
 			NStrx:  0,
-			NType:  nSect,        // local, defined in section
-			NSect:  uint8(1 + i), // 1-based section index
-			NDesc:  0,
-			NValue: 0,
-		})
-		symIdx[s.Name] = idx // default: section symbol; may be overridden below
-	}
-
-	// Exported (N_SECT | N_EXT) symbols for sections marked Exported=true.
-	for i, s := range f.sections {
-		if !s.Exported {
-			continue
-		}
-		idx := uint32(len(syms))
-		sym := nlist64{
-			NStrx:  strtab.intern("_" + s.Name), // Mach-O convention: leading underscore
-			NType:  nSect | nExt,
+			NType:  nSect,
 			NSect:  uint8(1 + i),
 			NDesc:  0,
 			NValue: 0,
+		})
+	}
+
+	// Local symbols (BindingLocal) — must precede globals in the nlist.
+	for i, s := range f.sections {
+		for _, sym := range s.Symbols {
+			if sym.Name == "" || sym.Binding != object.BindingLocal {
+				continue
+			}
+			idx := uint32(len(syms))
+			syms = append(syms, nlist64{
+				NStrx:  strtab.intern("_" + sym.Name),
+				NType:  nSect,
+				NSect:  uint8(1 + i),
+				NDesc:  0,
+				NValue: uint64(sym.Offset),
+			})
+			symDefs[sym.Name] = symEntry{idx, i, object.BindingLocal}
 		}
-		syms = append(syms, sym)
-		symIdx[s.Name] = idx // global overrides section symbol
+	}
+
+	// Global and weak defined symbols (BindingGlobal / BindingWeak).
+	// FlagLinkOnce marks all globals in the section as N_WEAK_DEF so the
+	// linker can dead-strip duplicate copies.
+	for i, s := range f.sections {
+		linkOnce := s.Flags&object.FlagLinkOnce != 0
+		for _, sym := range s.Symbols {
+			if sym.Name == "" {
+				continue
+			}
+			if sym.Binding != object.BindingGlobal && sym.Binding != object.BindingWeak {
+				continue
+			}
+			idx := uint32(len(syms))
+			desc := uint16(0)
+			if sym.Binding == object.BindingWeak || linkOnce {
+				desc |= nWeakDef
+			}
+			syms = append(syms, nlist64{
+				NStrx:  strtab.intern("_" + sym.Name),
+				NType:  nSect | nExt,
+				NSect:  uint8(1 + i),
+				NDesc:  desc,
+				NValue: uint64(sym.Offset),
+			})
+			symDefs[sym.Name] = symEntry{idx, i, sym.Binding}
+		}
 	}
 
 	// Undefined external (N_UNDF | N_EXT) symbols for each reloc target not
@@ -418,10 +590,10 @@ func (f *File) build() ([]byte, error) {
 			NDesc:  0,
 			NValue: 0,
 		})
-		symIdx[name] = idx
+		symDefs[name] = symEntry{idx, -1, object.BindingGlobal}
 	}
 
-	// ── Phase 3: fill relocation records ─────────────────────────────────
+	// ── Phase 4: fill relocation records ─────────────────────────────────
 
 	for i, s := range f.sections {
 		if len(s.Relocs) == 0 {
@@ -431,109 +603,42 @@ func (f *File) build() ([]byte, error) {
 		for j, r := range s.Relocs {
 			rd := secRel[i].descs[j]
 
-			si, ok := symIdx[r.Symbol]
+			def, ok := symDefs[r.Symbol]
 			if !ok {
-				return nil, fmt.Errorf("macho: section %q: relocation symbol %q not in symbol table",
-					s.Name, r.Symbol)
+				return nil, fmt.Errorf("macho: section[%d] reloc[%d]: symbol %q not in symbol table",
+					i, j, r.Symbol)
 			}
 
-			// Determine whether target is external (r_extern=1) or local
-			// (r_extern=0, r_symbolnum = 1-based section index).
-			isExternal := true
+			var isExternal bool
 			var rSymNum uint32
 
-			// Check if target is a section symbol (defined in this object) but
-			// not exported — then use section-relative reloc (r_extern=0).
-			targetSecIdx := -1
-			for k, sec := range f.sections {
-				if sec.Name == r.Symbol {
-					targetSecIdx = k
-					break
-				}
-			}
-			if targetSecIdx >= 0 && !f.sections[targetSecIdx].Exported {
+			if def.binding == object.BindingLocal && def.sectIdx >= 0 {
+				// Local defined symbol: section-relative relocation (r_extern=0).
 				isExternal = false
-				rSymNum = uint32(1 + targetSecIdx) // 1-based section ordinal
+				rSymNum = uint32(1 + def.sectIdx)
 			} else {
-				rSymNum = si
+				// Global, weak, or undefined: symbol-table relocation (r_extern=1).
+				isExternal = true
+				rSymNum = def.nlistIdx
 			}
 
-			// FIX 2: r.Offset is int32; cast to uint32 for the RAddress field.
 			records[j] = relocInfo{
-				RAddress: uint32(r.Offset),
+				RAddress: r.Offset,
 				RInfo:    packRelocInfo(rSymNum, rd.pcrel, rd.length, isExternal, rd.rtype),
 			}
 		}
 		secRel[i].records = records
 	}
 
-	// ── Phase 4: section metadata ─────────────────────────────────────────
+	// ── Phase 5: load command block size ──────────────────────────────────
 
-	type secMeta struct {
-		segName  string // destination segment for section_64.segname
-		sectName string // section_64.sectname
-		flags    uint32
-		align    uint32 // power-of-2 alignment (value, not log2)
-		rawSize  uint32 // bytes of content (0 for zerofill/BSS)
-		bssSize  uint64 // zerofill byte count
-	}
-	meta := make([]secMeta, nSec)
-
-	for i, s := range f.sections {
-		switch s.Kind {
-		case enc.SectionText:
-			meta[i] = secMeta{
-				segName:  "__TEXT",
-				sectName: "__text",
-				flags:    sAttrPureInstructions | sAttrSomeInstructions,
-				align:    16,
-				rawSize:  uint32(len(s.Code)),
-			}
-		case enc.SectionData:
-			meta[i] = secMeta{
-				segName:  "__DATA",
-				sectName: "__data",
-				flags:    sTypeRegular,
-				align:    8,
-				rawSize:  uint32(len(s.Code)),
-			}
-		case enc.SectionROData:
-			meta[i] = secMeta{
-				segName:  "__TEXT",
-				sectName: "__const",
-				flags:    sTypeRegular,
-				align:    8,
-				rawSize:  uint32(len(s.Code)),
-			}
-		case enc.SectionBSS:
-			// FIX 3: Section.Size field was removed; BSS size is now len(s.Code),
-			// which the encoder sets to the required zero-fill byte count.
-			meta[i] = secMeta{
-				segName:  "__DATA",
-				sectName: "__bss",
-				flags:    sTypeZerofill,
-				align:    8,
-				bssSize:  uint64(len(s.Code)),
-			}
-		}
-	}
-
-	// ── Phase 5: compute load command block size ──────────────────────────
-
-	// The load command block begins immediately after the Mach-O header.
-	// It contains:
-	//   LC_SEGMENT_64:  72 + nSec×80 bytes
-	//   LC_BUILD_VERSION (optional): 24 bytes
-	//   LC_SYMTAB:  24 bytes
 	lcSegSize := uint32(segCmdSize64 + nSec*sectionSize64)
 	lcBvSize := uint32(0)
 	if f.buildVersion {
 		lcBvSize = buildVerCmdSize
 	}
-	lcSymSize := uint32(symtabCmdSize)
-	totalLCSize := lcSegSize + lcBvSize + lcSymSize
+	totalLCSize := lcSegSize + lcBvSize + uint32(symtabCmdSize)
 
-	// Data region starts right after header + load commands.
 	dataStart := uint32(mhSize64) + totalLCSize
 
 	// ── Phase 6: file-offset layout for section data & relocs ────────────
@@ -546,44 +651,33 @@ func (f *File) build() ([]byte, error) {
 	layout := make([]secLayout, nSec)
 
 	pos := dataStart
-	for i, s := range f.sections {
-		if s.Kind == enc.SectionBSS {
+	for i := range f.sections {
+		if meta[i].isZerofill {
 			continue
 		}
 		pos = alignUp(pos, meta[i].align)
 		layout[i].dataOff = pos
 		pos += meta[i].rawSize
 
-		nr := uint32(len(secRel[i].records))
-		if nr > 0 {
-			// relocation_info entries need no special alignment (8 bytes, and
-			// pos should already be at least 4-byte aligned after raw data).
+		if nr := uint32(len(secRel[i].records)); nr > 0 {
 			layout[i].relocOff = pos
 			layout[i].nReloc = nr
 			pos += nr * relocSize
 		}
 	}
 
-	// Symbol table and string table come after all section data+relocs.
 	symOff := pos
 	strOff := symOff + uint32(len(syms))*nlistSize64
 	strSize := uint32(len(strtab.bytes()))
 
-	// ── Phase 7: compute segment vmsize (sum of all section sizes) ────────
+	// ── Phase 7: segment vmsize and file size ─────────────────────────────
 
-	var segVMSize uint64
-	for i, s := range f.sections {
-		if s.Kind == enc.SectionBSS {
+	var segVMSize, segFileSize uint64
+	for i := range f.sections {
+		if meta[i].isZerofill {
 			segVMSize += meta[i].bssSize
 		} else {
 			segVMSize += uint64(meta[i].rawSize)
-		}
-	}
-
-	// Total file bytes occupied by the segment's section content (excluding BSS).
-	var segFileSize uint64
-	for i, s := range f.sections {
-		if s.Kind != enc.SectionBSS {
 			segFileSize += uint64(meta[i].rawSize)
 		}
 	}
@@ -592,13 +686,12 @@ func (f *File) build() ([]byte, error) {
 
 	out := new(bytes.Buffer)
 
-	// Count load commands.
 	nCmds := uint32(2) // LC_SEGMENT_64 + LC_SYMTAB
 	if f.buildVersion {
 		nCmds++
 	}
 
-	// Mach-O header
+	// mach_header_64
 	hdr := machHeader64{
 		Magic:      mhMagic64,
 		CPUType:    f.cpuType,
@@ -607,18 +700,16 @@ func (f *File) build() ([]byte, error) {
 		NCmds:      nCmds,
 		SizeOfCmds: totalLCSize,
 		Flags:      mhSubsectionsViaSymbols,
-		Reserved:   0,
 	}
 	if err := binary.Write(out, le, hdr); err != nil {
 		return nil, fmt.Errorf("macho: write header: %w", err)
 	}
 
-	// LC_SEGMENT_64
+	// LC_SEGMENT_64 — single unnamed segment for MH_OBJECT.
 	var seg segmentCommand64
 	seg.Cmd = lcSegment64
 	seg.CmdSize = lcSegSize
-	// MH_OBJECT: segment name is empty (the single unnamed segment).
-	// segname[16] is already zeroed.
+	// SegName[16] stays zeroed — the unnamed segment.
 	seg.VMAddr = 0
 	seg.VMSize = segVMSize
 	seg.FileOff = uint64(dataStart)
@@ -626,27 +717,22 @@ func (f *File) build() ([]byte, error) {
 	seg.MaxProt = vmProtRead | vmProtWrite | vmProtExecute
 	seg.InitProt = vmProtRead | vmProtWrite | vmProtExecute
 	seg.NSects = uint32(nSec)
-	seg.Flags = 0
 	if err := binary.Write(out, le, seg); err != nil {
 		return nil, fmt.Errorf("macho: write LC_SEGMENT_64: %w", err)
 	}
 
 	// section_64 entries — one per input section.
-	for i, s := range f.sections {
+	for i := range f.sections {
 		var sh section64
 		copyPaddedName(sh.SectName[:], meta[i].sectName)
 		copyPaddedName(sh.SegName[:], meta[i].segName)
 		sh.Addr = 0
 		sh.Flags = meta[i].flags
-
-		// log2 of alignment
 		sh.Align = log2(meta[i].align)
 
-		if s.Kind == enc.SectionBSS {
+		if meta[i].isZerofill {
 			sh.Size = meta[i].bssSize
-			sh.Offset = 0 // zerofill: no file bytes
-			sh.RelOff = 0
-			sh.NReloc = 0
+			// Offset, RelOff, NReloc remain 0 for zerofill.
 		} else {
 			sh.Size = uint64(meta[i].rawSize)
 			sh.Offset = layout[i].dataOff
@@ -654,7 +740,7 @@ func (f *File) build() ([]byte, error) {
 			sh.NReloc = layout[i].nReloc
 		}
 		if err := binary.Write(out, le, sh); err != nil {
-			return nil, fmt.Errorf("macho: write section_64[%d] (%s): %w", i, s.Name, err)
+			return nil, fmt.Errorf("macho: write section_64[%d]: %w", i, err)
 		}
 	}
 
@@ -674,36 +760,32 @@ func (f *File) build() ([]byte, error) {
 	}
 
 	// LC_SYMTAB
-	symCmd := symtabCommand{
+	if err := binary.Write(out, le, symtabCommand{
 		Cmd:     lcSymtab,
 		CmdSize: symtabCmdSize,
 		SymOff:  symOff,
 		NSyms:   uint32(len(syms)),
 		StrOff:  strOff,
 		StrSize: strSize,
-	}
-	if err := binary.Write(out, le, symCmd); err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("macho: write LC_SYMTAB: %w", err)
 	}
 
-	// Section data + inline relocation tables
+	// Section data + inline relocation tables.
 	for i, s := range f.sections {
-		if s.Kind == enc.SectionBSS {
+		if meta[i].isZerofill {
 			continue
 		}
 		padTo(out, layout[i].dataOff)
-
-		code := applyImplicitAddends(s.Code, s.Relocs, secRel[i].descs)
-		out.Write(code)
-
+		out.Write(applyImplicitAddends(s.Code, s.Relocs, secRel[i].descs))
 		for _, r := range secRel[i].records {
 			if err := binary.Write(out, le, r); err != nil {
-				return nil, fmt.Errorf("macho: write reloc for section %s: %w", s.Name, err)
+				return nil, fmt.Errorf("macho: write reloc for section[%d]: %w", i, err)
 			}
 		}
 	}
 
-	// Symbol table
+	// nlist_64 symbol table.
 	padTo(out, symOff)
 	for _, sym := range syms {
 		if err := binary.Write(out, le, sym); err != nil {
@@ -711,7 +793,7 @@ func (f *File) build() ([]byte, error) {
 		}
 	}
 
-	// String table
+	// String table.
 	padTo(out, strOff)
 	out.Write(strtab.bytes())
 
@@ -729,7 +811,7 @@ func copyPaddedName(dst []byte, name string) {
 }
 
 // log2 returns the base-2 logarithm of a power-of-two value v.
-// Returns 0 for v==0 or v==1.
+// Returns 0 for v == 0 or v == 1.
 func log2(v uint32) uint32 {
 	if v <= 1 {
 		return 0
