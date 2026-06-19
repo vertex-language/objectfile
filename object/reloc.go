@@ -17,7 +17,7 @@ const (
 	// AArch64
 	RelocPCRel26   // B/BL 26-bit PC-relative
 	RelocADRPage21 // ADRP 21-bit page-delta
-	RelocAddOff12  // ADD/LDR low 12-bit page offset
+	RelocAddOff12  // ADD low 12-bit page offset (unshifted)
 	RelocGOTPage21 // ADRP to GOT entry page
 	RelocGOTOff12  // LDR low 12-bit offset into GOT entry
 
@@ -34,12 +34,31 @@ const (
 
 	// COFF-specific
 	RelocIAT // Import Address Table
+
+	// AArch64 scaled symbol-low-12 for loads/stores.
+	//
+	// RelocAddOff12 places the unshifted low 12 bits of the symbol address, as
+	// an ADD expects. A scaled load/store, however, holds offset>>log2(size) in
+	// its imm12 field, so the linker must shift the low-12 value by the access
+	// scale before inserting it — which is exactly what the size-specific
+	// R_AARCH64_LDSTn_ABS_LO12_NC relocations do. Using RelocAddOff12 on a
+	// non-byte load/store would write the wrong bits, so each access width gets
+	// its own kind.
+	//
+	// ELF: R_AARCH64_LDST{8,16,32,64,128}_ABS_LO12_NC.
+	// Mach-O: all collapse to ARM64_RELOC_PAGEOFF12 (the linker derives the
+	// shift from the instruction encoding).
+	RelocLDST8Off12   // 1-byte access  (no shift)
+	RelocLDST16Off12  // 2-byte access  (>>1)
+	RelocLDST32Off12  // 4-byte access  (>>2)
+	RelocLDST64Off12  // 8-byte access  (>>3)
+	RelocLDST128Off12 // 16-byte access (>>4)
 )
 
 // Reloc describes one relocation applied within a Section.
 type Reloc struct {
 	Offset uint32
-	Symbol string   // target symbol name; need not be defined in this object file
+	Symbol string    // target symbol name; need not be defined in this object file
 	Kind   RelocKind
-	Addend int64    // logical addend; encoding is format-driven, not caller-driven
+	Addend int64     // logical addend; encoding is format-driven, not caller-driven
 }
