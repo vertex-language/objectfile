@@ -277,26 +277,29 @@ func addendSize(rd relocDesc) int {
 // applyImplicitAddends returns a copy of code with each relocation's addend
 // written into the appropriate bytes at r.Offset (little-endian).
 func applyImplicitAddends(code []byte, relocs []object.Reloc, descs []relocDesc) []byte {
-	if len(relocs) == 0 {
-		return code
-	}
-	patched := make([]byte, len(code))
-	copy(patched, code)
-	le := binary.LittleEndian
-	for i, r := range relocs {
-		sz := addendSize(descs[i])
-		end := int(r.Offset) + sz
-		if end > len(patched) {
-			continue // malformed input; kind error already caught in Phase 1
-		}
-		switch sz {
-		case 8:
-			le.PutUint64(patched[r.Offset:], uint64(r.Addend))
-		default:
-			le.PutUint32(patched[r.Offset:], uint32(int32(r.Addend)))
-		}
-	}
-	return patched
+    if len(relocs) == 0 {
+        return code
+    }
+    patched := make([]byte, len(code))
+    copy(patched, code)
+    le := binary.LittleEndian
+    for i, r := range relocs {
+        if r.Addend == 0 {
+            continue // instruction bytes are already the correct placeholder
+        }
+        sz := addendSize(descs[i])
+        end := int(r.Offset) + sz
+        if end > len(patched) {
+            continue
+        }
+        switch sz {
+        case 8:
+            le.PutUint64(patched[r.Offset:], uint64(r.Addend))
+        default:
+            le.PutUint32(patched[r.Offset:], uint32(int32(r.Addend)))
+        }
+    }
+    return patched
 }
 
 // ── External symbol discovery ─────────────────────────────────────────────────
