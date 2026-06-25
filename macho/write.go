@@ -615,12 +615,21 @@ func (f *File) build() ([]byte, error) {
 			var isExternal bool
 			var rSymNum uint32
 
-			if def.binding == object.BindingLocal && def.sectIdx >= 0 {
-				// Local defined symbol: section-relative relocation (r_extern=0).
+			// ARM64 ADRP (PAGE21) and ADD/LDR-offset (PAGEOFF12) relocations must
+			// always use r_extern=1 on Mach-O. The r_extern=0 form resolves as
+			// section_base + addend_in_instruction, but the encoder zeroes the imm
+			// field and leaves it for the linker, so every local symbol would collapse
+			// to section offset 0 (the first symbol). With r_extern=1 the linker reads
+			// the correct NValue from the nlist entry instead.
+			arm64PageReloc := f.cpuType == cpuTypeARM64 &&
+				(rd.rtype == arm64RelocPage21 || rd.rtype == arm64RelocPageoff12)
+
+			if def.binding == object.BindingLocal && def.sectIdx >= 0 && !arm64PageReloc {
+				// Local defined symbol: section-relative (r_extern=0).
 				isExternal = false
 				rSymNum = uint32(1 + def.sectIdx)
 			} else {
-				// Global, weak, or undefined: symbol-table relocation (r_extern=1).
+				// Global, weak, undefined, or ARM64 page reloc: symbol-table (r_extern=1).
 				isExternal = true
 				rSymNum = def.nlistIdx
 			}
