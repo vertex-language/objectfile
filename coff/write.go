@@ -397,7 +397,20 @@ func padTo(buf *bytes.Buffer, target uint32) {
 // applyImplicitAddends returns a new copy of code with each relocation's
 // Addend written into the appropriate bytes at r.Offset. The original slice
 // is never modified. All writes are little-endian.
-func applyImplicitAddends(code []byte, relocs []object.Reloc, rtypes []uint16) []byte {
+//
+// The encoder speaks the ELF RELA convention, where the linker computes
+// S + A - P, so a PC-relative site carries A = -(4 + trailing-imm-bytes).
+// Conformant COFF instead defines REL32 as S + field - (P + 4): the +4 is
+// intrinsic to the relocation type. To make a standards-compliant linker
+// arrive at the same displacement, the implicit addend baked into the bytes
+// for an AMD64 REL32 site must be A + 4. Without this the -4 is applied twice
+// (once here, once by REL32's definition) and every call/RIP reference lands
+// 4 bytes short.
+//
+// The bump is gated on machine because relAMD64Rel32 and relARM64PagebaseRel21
+// share the value 0x0004; the ARM64 path uses addend 0 with an S+A-P patcher
+// and must not be adjusted.
+func applyImplicitAddends(code []byte, relocs []object.Reloc, rtypes []uint16, machine uint16) []byte {
 	if len(relocs) == 0 {
 		return code
 	}
@@ -410,11 +423,17 @@ func applyImplicitAddends(code []byte, relocs []object.Reloc, rtypes []uint16) [
 			// Malformed offset; relocType validation in build() catches this first.
 			continue
 		}
+
+		addend := r.Addend
+		if machine == machineAMD64 && rtypes[i] == relAMD64Rel32 {
+			addend += 4
+		}
+
 		switch sz {
 		case 8:
-			binary.LittleEndian.PutUint64(patched[r.Offset:], uint64(r.Addend))
+			binary.LittleEndian.PutUint64(patched[r.Offset:], uint64(addend))
 		default:
-			binary.LittleEndian.PutUint32(patched[r.Offset:], uint32(int32(r.Addend)))
+			binary.LittleEndian.PutUint32(patched[r.Offset:], uint32(int32(addend)))
 		}
 	}
 	return patched
@@ -779,7 +798,7 @@ func (f *File) build() ([]byte, error) {
 		padTo(out, layout[i].rawOff)
 
 		// Bake implicit addends into a scratch copy of Code before writing.
-		code := applyImplicitAddends(s.Code, s.Relocs, secRel[i].rtypes)
+		code := applyImplicitAddends(s.Code, s.Relocs, secRel[i].rtypes, f.machine)
 		out.Write(code)
 
 		for _, r := range secRel[i].records {
