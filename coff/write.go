@@ -129,9 +129,11 @@ func (f *File) relocType(k object.RelocKind) (uint16, error) {
 			return relAMD64Addr64, nil
 		case object.RelocAbs32:
 			return relAMD64Addr32, nil
-		case object.RelocPCRel32, object.RelocPLT32: // PLT32 == direct call on COFF; no PLT exists
+		case object.RelocPCRel32, object.RelocPLT32:
 			return relAMD64Rel32, nil
 		case object.RelocIAT:
+			return relAMD64Addr32NB, nil
+		case object.RelocAddr32NB:
 			return relAMD64Addr32NB, nil
 		case object.RelocTLSIE:
 			return relAMD64Secrel, nil
@@ -142,9 +144,11 @@ func (f *File) relocType(k object.RelocKind) (uint16, error) {
 			return relARM64Addr64, nil
 		case object.RelocAbs32:
 			return relARM64Addr32, nil
-		case object.RelocPCRel26, object.RelocPLT32: // PLT32 → BRANCH26 on COFF ARM64
+		case object.RelocPCRel26, object.RelocPLT32:
 			return relARM64Branch26, nil
 		case object.RelocIAT:
+			return relARM64Addr32NB, nil
+		case object.RelocAddr32NB:
 			return relARM64Addr32NB, nil
 		case object.RelocTLSIE:
 			return relARM64Secrel, nil

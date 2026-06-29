@@ -33,7 +33,8 @@ const (
 	RelocTLSLE // Local Exec: TP-relative offset, resolved at link time
 
 	// COFF-specific
-	RelocIAT // Import Address Table
+	RelocIAT      // Import Address Table
+	RelocAddr32NB // 32-bit image-relative (RVA); used for .pdata RUNTIME_FUNCTION entries
 
 	// AArch64 scaled symbol-low-12 for loads/stores.
 	//
